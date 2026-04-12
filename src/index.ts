@@ -1,0 +1,1581 @@
+/**
+ * Universal AI Cloud Server.
+ *
+ * Standalone Node.js Express server with:
+ *   - PostgreSQL database
+ *   - Observation bus, insight extractor, persona engine
+ *   - All API endpoints (chat, briefing, situation, glasses WebSocket)
+ *   - Personal access token authentication
+ *   - Centrum, Gmail, Calendar connectors
+ */
+
+import 'dotenv/config'
+import express from 'express'
+import { createServer } from 'http'
+import { WebSocketServer, type WebSocket } from 'ws'
+import crypto from 'crypto'
+import { generateDailyDigest, generateWeeklyDigest, backfillDigests, startDigestScheduler } from './digest'
+import { detectTrends } from './trends'
+import { analyzeForLifeEvent, cleanupWifiHistory } from './life-events'
+import { rewritePersonaWithConfidence, buildConfidenceContext } from './persona-confidence'
+import { processCorrection, detectCorrectionInQuery, detectDraftEdit, buildLessonsForPersonaWriter } from './active-learning'
+import {
+  insertCorrection, markCorrectionsApplied, getActiveLessons, getAllCorrections,
+  forgetLastQuery, forgetLastNQueries, forgetQueriesByKeyword, forgetQueriesInWindow, forgetAllQueries
+} from './db'
+import { runRelationshipEngine, getTopRelationships, formatRelationshipsForContext } from './relationship-engine'
+import { extractRoutines, detectRoutineBreaks, getActiveRoutines, getRecentBreaks, formatRoutinesForContext } from './routine-engine'
+import { extractSkills, getSkills, formatSkillsForContext } from './skill-extractor'
+import { runSecondPass } from './second-pass'
+import { runActionPredictor, getPendingActions, formatPredictedActionsForContext, regenerateOnEvent, markActionServed } from './action-predictor'
+import { generateChain, generateChainsForUrgentItems, completeChainStep, getActiveChains, formatChainsForContext } from './chain-reasoner'
+import { getCachedContext, invalidateCache, getCacheStats, assembleContext, classifyQuery, rebuildCache } from './context-cache'
+import {
+  initDB, migrate, getPool, getSettings, setSetting,
+  getLivingProfile, setLivingProfile,
+  listContacts, listStaleThreads, listThreadsAwaitingReply,
+  listCommitments, listUpcomingEvents, listRecentDocuments,
+  listProposedActions, updateActionStatus, insertProposedAction,
+  getObservationCountBySource, totalObservationCount, getRecentObservations,
+  listInsights, insertObservation,
+  insertCentrumSnapshot, getLatestCentrumSnapshot, upsertCommitment,
+  insertQueryMemory, getRecentQueryMemory, pruneQueryMemory
+} from './db'
+
+const PORT = parseInt(process.env.PORT || '3210', 10)
+
+// ── Access token ──────────────────────────────────────────────────
+
+let ACCESS_TOKEN = process.env.ACCESS_TOKEN || ''
+
+async function ensureAccessToken(): Promise<void> {
+  if (!ACCESS_TOKEN) {
+    ACCESS_TOKEN = crypto.randomBytes(32).toString('hex')
+    console.log(`[auth] Generated access token: ${ACCESS_TOKEN}`)
+    console.log('[auth] Set ACCESS_TOKEN env var to persist this token')
+  }
+}
+
+function authMiddleware(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  // Skip auth for health check
+  if (req.path === '/health') { next(); return }
+
+  const header = req.headers.authorization
+  if (!header || header !== `Bearer ${ACCESS_TOKEN}`) {
+    res.status(401).json({ error: 'Unauthorized — include Authorization: Bearer <token>' })
+    return
+  }
+  next()
+}
+
+// ── Entity extraction from response text ─────────────────────────
+
+// ── Forget command parser ─────────────────────────────────────────
+
+async function handleForgetCommand(content: string): Promise<string | null> {
+  const lower = content.toLowerCase().trim()
+
+  // Must start with "forget"
+  if (!lower.startsWith('forget')) return null
+
+  const rest = lower.slice(6).trim()
+
+  // "forget that" / "forget the last query" / "forget last"
+  if (rest === 'that' || rest === 'the last query' || rest === 'last' || rest === 'it' || rest === '') {
+    const deleted = await forgetLastQuery()
+    return deleted > 0
+      ? 'Forgotten: last query. Persona and observations unaffected.'
+      : 'Nothing to forget — no recent queries in memory.'
+  }
+
+  // "forget everything" / "forget all" / "forget all queries"
+  if (rest === 'everything' || rest === 'all' || rest === 'all queries' || rest === 'all memory') {
+    const deleted = await forgetAllQueries()
+    return `Forgotten: all ${deleted} queries from conversation memory. Persona and observations unaffected.`
+  }
+
+  // "forget the last N queries" / "forget last 3" / "forget last 5 queries"
+  const lastNMatch = rest.match(/^(?:the )?last (\d+)\s*(?:queries|messages)?$/)
+  if (lastNMatch) {
+    const n = parseInt(lastNMatch[1])
+    const deleted = await forgetLastNQueries(n)
+    return `Forgotten: last ${deleted} queries. Persona and observations unaffected.`
+  }
+
+  // "forget everything from the last N minutes" / "forget last 10 minutes"
+  const timeMatch = rest.match(/^(?:everything )?(?:from )?(?:the )?last (\d+)\s*min(?:utes?)?$/)
+  if (timeMatch) {
+    const minutes = parseInt(timeMatch[1])
+    const deleted = await forgetQueriesInWindow(minutes)
+    return `Forgotten: ${deleted} queries from the last ${minutes} minutes. Persona and observations unaffected.`
+  }
+
+  // "forget [keyword] stuff" / "forget Rajeev stuff" / "forget what I said about X"
+  const keywordMatch = rest.match(/^(?:what I said about |about |)([\w\s]+?)(?:\s+stuff|\s+things|\s+queries)?$/)
+  if (keywordMatch) {
+    const keyword = keywordMatch[1].trim()
+    if (keyword.length >= 2 && keyword.length <= 50) {
+      const deleted = await forgetQueriesByKeyword(keyword)
+      return deleted > 0
+        ? `Forgotten: ${deleted} queries mentioning "${keyword}" from the last hour. Persona and observations unaffected.`
+        : `No queries mentioning "${keyword}" found in the last hour.`
+    }
+  }
+
+  // Didn't match any pattern — not a forget command, pass through to normal flow
+  return null
+}
+
+function extractEntitiesFromText(responseText: string, queryText: string): string[] {
+  const entities: Set<string> = new Set()
+  const combined = responseText + ' ' + queryText
+
+  // Extract **bold entities** from markup
+  const boldMatches = combined.matchAll(/\*\*([^*]+)\*\*/g)
+  for (const m of boldMatches) {
+    entities.add(m[1].trim())
+  }
+
+  // Extract names: capitalized multi-word sequences (e.g., "Rajeev Kumar", "Nisha Kurur")
+  const nameMatches = combined.matchAll(/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/g)
+  for (const m of nameMatches) {
+    const name = m[1].trim()
+    // Filter out common non-name phrases
+    if (!['Extended Essay', 'Google Chrome', 'Google Calendar', 'No Data'].includes(name)) {
+      entities.add(name)
+    }
+  }
+
+  // Extract times (2:15pm, 10:30 AM, etc.)
+  const timeMatches = combined.matchAll(/\b(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)\b/g)
+  for (const m of timeMatches) entities.add(m[1].trim())
+
+  // Extract dates
+  const dateMatches = combined.matchAll(/\b(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*(?:\s+\d{4})?)\b/gi)
+  for (const m of dateMatches) entities.add(m[1].trim())
+
+  // Extract project/topic names from known patterns
+  const projectPatterns = [
+    /Extended Essay/gi, /History IA/gi, /CAS Documentation/gi,
+    /Kutty Olam/gi, /Chetana Trust/gi, /Centrum/gi, /IRIS/gi,
+    /TATTVA/gi, /IBDP/gi, /Airpoint/gi
+  ]
+  for (const pat of projectPatterns) {
+    const m = combined.match(pat)
+    if (m) entities.add(m[0])
+  }
+
+  return Array.from(entities).slice(0, 20)
+}
+
+// ── Server setup ──────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+  // Init database
+  initDB()
+  await migrate()
+  await ensureAccessToken()
+
+  const app = express()
+
+  // CORS
+  app.use((_req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*')
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+    if (_req.method === 'OPTIONS') { res.sendStatus(204); return }
+    next()
+  })
+
+  app.use(express.json({ limit: '50mb' }))
+  app.use(authMiddleware)
+
+  // ── Health (no auth required) ───────────────────────────────
+
+  app.get('/health', async (_req, res) => {
+    const obsCount = await totalObservationCount()
+    const profile = await getLivingProfile()
+    res.json({
+      status: 'ok',
+      version: '0.1.0',
+      observations: obsCount,
+      persona_length: profile?.length ?? 0,
+      uptime: process.uptime()
+    })
+  })
+
+  // ── POST /api/chat/stream (SSE streaming spotlight) ──────────
+
+  app.post('/api/chat/stream', async (req, res) => {
+    const abortController = new AbortController()
+    req.on('close', () => abortController.abort())
+
+    try {
+      const { content, mode } = req.body
+      if (!content) { res.status(400).json({ error: 'content required' }); return }
+
+      // Forget commands: handled without streaming
+      const forgetResult = await handleForgetCommand(content)
+      if (forgetResult) {
+        res.setHeader('Content-Type', 'text/event-stream')
+        res.setHeader('Cache-Control', 'no-cache')
+        res.setHeader('Connection', 'keep-alive')
+        res.write(`data: ${JSON.stringify({ type: 'text', content: forgetResult })}\n\n`)
+        res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`)
+        res.end()
+        return
+      }
+
+      const settings = await getSettings()
+      const apiKey = settings.api_key || process.env.ANTHROPIC_API_KEY
+      if (!apiKey) { res.status(400).json({ error: 'No Anthropic API key' }); return }
+
+      insertObservation('chat', 'queried', content, {}, 'neutral', [], '').catch(() => {})
+      pruneQueryMemory(30).catch(() => {})
+
+      const Anthropic = (await import('@anthropic-ai/sdk')).default
+      const client = new Anthropic({ apiKey })
+
+      const recentQueries = await getRecentQueryMemory(10, 30)
+
+      // Correction detection (same as non-streaming)
+      const lastQuery = recentQueries.length > 0 ? recentQueries[recentQueries.length - 1] : null
+      const { isCorrection, correctionText: corrText } = detectCorrectionInQuery(content, lastQuery?.response_text || null)
+      if (isCorrection && lastQuery) {
+        insertCorrection(lastQuery.response_text?.slice(0, 500) || '', lastQuery.query_text || '', 'corrected', corrText, '', []).catch(() => {})
+        processCorrection(lastQuery.response_text?.slice(0, 200) || '', 'corrected', corrText, lastQuery.query_text || '').catch(() => {})
+      }
+
+      const queryClass = classifyQuery(content)
+      const cached = await getCachedContext()
+
+      const recentConversation = recentQueries.length > 0
+        ? `RECENT CONVERSATION (last 30 minutes):\n${recentQueries.map((q: any) => {
+            const entities = Array.isArray(q.entities_mentioned) ? q.entities_mentioned :
+              (typeof q.entities_mentioned === 'string' ? JSON.parse(q.entities_mentioned) : [])
+            return `User: "${q.query_text}"\nIRIS: "${(q.response_text || '').slice(0, 150)}"${entities.length ? ` [entities: ${entities.join(', ')}]` : ''}`
+          }).join('\n\n')}`
+        : ''
+
+      const context = assembleContext(cached, queryClass.type, recentConversation)
+      const isSpotlight = mode === 'spotlight'
+
+      const IRIS_RULES = `You are IRIS — a sharp, informed personal assistant embedded in a macOS Spotlight bar. You already know everything about this person. You are NOT a chatbot or search engine.
+
+RESPONSE RULES:
+- Lead with the answer. Never lead with context or preamble.
+- Default to the shortest honest answer. Simple facts: 1 line. Status checks: 2 lines max. Complex queries: 3-5 lines max.
+- No greetings, no sign-offs, no filler. Just the answer.
+- Prefer specific over vague. If no data, say what's missing. Never apologize.
+
+CONFIDENCE RULES:
+- High (>80%): state as fact. Medium (50-80%): hedge. Low (<50%): uncertainty or omit.
+
+OPINION RULES:
+- Recommendations: pick ONE answer with one-sentence defense. Commit, don't list.
+
+FORMATTING:
+- **bold** for entities. {{curly}} for metadata. [Button] for actions.`
+
+      const systemBlocks: any[] = isSpotlight ? [
+        { type: 'text', text: IRIS_RULES, cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: `\n\nCONTEXT:\n${context}`, cache_control: { type: 'ephemeral' } }
+      ] : [
+        { type: 'text', text: `You are Universal AI. Be concise and helpful.\n\n${context}` }
+      ]
+
+      // Set SSE headers
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no' // Disable nginx/render buffering
+      })
+      // Send initial ping to confirm connection
+      res.write(`data: ${JSON.stringify({ type: 'ping' })}\n\n`)
+
+      // Stream from Claude using the async iterator API
+      let fullText = ''
+      try {
+        const systemStr = systemBlocks.map((b: any) => b.text).join('\n')
+
+        // Use non-streaming Claude call, but write result immediately
+        // Streaming through Render's proxy has buffering issues. Instead,
+        // we call Claude normally and stream the RESULT to the client token by token
+        const result = await client.messages.create({
+          model: settings.model || 'claude-sonnet-4-20250514',
+          max_tokens: isSpotlight ? 300 : 500,
+          system: systemStr,
+          messages: [{ role: 'user', content }]
+        })
+
+        fullText = result.content[0].type === 'text' ? result.content[0].text : ''
+
+        // Stream the response to client character by character (simulated streaming)
+        // This gives the client tokens progressively for the typing animation
+        if (fullText.length > 0) {
+          // Send in chunks of ~10 chars for smooth animation
+          for (let i = 0; i < fullText.length; i += 10) {
+            if (abortController.signal.aborted) break
+            const chunk = fullText.slice(i, i + 10)
+            res.write(`data: ${JSON.stringify({ type: 'text', content: chunk })}\n\n`)
+          }
+        }
+
+        res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`)
+      } catch (err: any) {
+        console.error(`[stream] Error: ${err.message}`)
+        try { res.write(`data: ${JSON.stringify({ type: 'error', content: err.message })}\n\n`) } catch {}
+      }
+
+      // Post-stream: store in query memory, run second-pass (fire-and-forget)
+      if (fullText.length > 0) {
+        const entities = extractEntitiesFromText(fullText, content)
+        insertQueryMemory(content, fullText, entities).catch(() => {})
+      }
+
+      res.end()
+    } catch (err: any) {
+      if (!res.headersSent) {
+        res.status(500).json({ error: err.message })
+      } else {
+        res.write(`data: ${JSON.stringify({ type: 'error', content: err.message })}\n\n`)
+        res.end()
+      }
+    }
+  })
+
+  // ── POST /api/chat (Spotlight queries — non-streaming) ──────
+
+  app.post('/api/chat', async (req, res) => {
+    try {
+      const { content, mode } = req.body
+      if (!content) { res.status(400).json({ error: 'content required' }); return }
+
+      // ── Forget commands: handled entirely in code, no Claude call ──
+      const forgetResult = await handleForgetCommand(content)
+      if (forgetResult) {
+        res.json({ text: forgetResult })
+        return
+      }
+
+      const settings = await getSettings()
+      const apiKey = settings.api_key || process.env.ANTHROPIC_API_KEY
+      if (!apiKey) { res.status(400).json({ error: 'No Anthropic API key' }); return }
+
+      // Log as observation (fire-and-forget)
+      insertObservation('chat', 'queried', content, {}, 'neutral', [], '').catch(() => {})
+
+      // Prune stale query memory (fire-and-forget)
+      pruneQueryMemory(30).catch(() => {})
+
+      const Anthropic = (await import('@anthropic-ai/sdk')).default
+      const client = new Anthropic({ apiKey })
+
+      // Load recent conversation context (last 10 queries within 30 minutes)
+      const recentQueries = await getRecentQueryMemory(10, 30)
+
+      // Check if this query is a correction of a previous response
+      const lastQuery = recentQueries.length > 0 ? recentQueries[recentQueries.length - 1] : null
+      const { isCorrection, correctionText: corrText } = detectCorrectionInQuery(content, lastQuery?.response_text || null)
+      if (isCorrection && lastQuery) {
+        insertCorrection(
+          lastQuery.response_text?.slice(0, 500) || 'previous response',
+          lastQuery.query_text || '',
+          'corrected',
+          corrText,
+          '', // reasoning chain — we don't have it yet
+          []
+        ).catch(() => {})
+        processCorrection(
+          lastQuery.response_text?.slice(0, 200) || '',
+          'corrected',
+          corrText,
+          lastQuery.query_text || ''
+        ).catch(() => {})
+      }
+
+      // Check if this is a draft edit action
+      const { isDraftEdit, editedPart, originalDraft } = detectDraftEdit(content, lastQuery?.query_text || null, lastQuery?.response_text || null)
+      if (isDraftEdit) {
+        insertCorrection(
+          originalDraft.slice(0, 500),
+          editedPart,
+          'edited_draft',
+          `User wants to edit the draft for: ${editedPart}`,
+          '',
+          []
+        ).catch(() => {})
+        processCorrection(
+          `Draft: ${originalDraft.slice(0, 200)}`,
+          'edited_draft',
+          `User edited: ${editedPart}`,
+          editedPart
+        ).catch(() => {})
+      }
+
+      // ── Classify query and load context from cache ──────────────
+      const queryClass = classifyQuery(content)
+      const t0 = Date.now()
+
+      // Get cached context (rebuilds if stale — all DB queries run in parallel)
+      const cached = await getCachedContext()
+      const cacheMs = Date.now() - t0
+
+      // Format recent conversation (always fresh, not cached)
+      const recentConversation = recentQueries.length > 0
+        ? `RECENT CONVERSATION (last 30 minutes):\n${recentQueries.map((q: any) => {
+            const entities = Array.isArray(q.entities_mentioned) ? q.entities_mentioned :
+              (typeof q.entities_mentioned === 'string' ? JSON.parse(q.entities_mentioned) : [])
+            return `User: "${q.query_text}"\nIRIS: "${(q.response_text || '').slice(0, 150)}"${entities.length ? ` [entities: ${entities.join(', ')}]` : ''}`
+          }).join('\n\n')}`
+        : ''
+
+      // Assemble context sized by query type
+      const context = assembleContext(cached, queryClass.type, recentConversation)
+
+      const isSpotlight = mode === 'spotlight'
+
+      // ── Build system prompt with cache_control for stable blocks ──
+      // Stable blocks (persona, rules, context) get cache_control for
+      // Anthropic prompt caching. Volatile parts (query) stay uncached.
+
+      const IRIS_RULES = `You are IRIS — a sharp, informed personal assistant embedded in a macOS Spotlight bar. You already know everything about this person. You are NOT a chatbot or search engine.
+
+RESPONSE RULES:
+- Lead with the answer. Never lead with context or preamble.
+- Default to the shortest honest answer. Simple facts: 1 line. Status checks: 2 lines max. Complex queries: 3-5 lines max.
+- NEVER use: "Looking at your...", "Based on your...", "It seems like...", "I can see that...", "It appears...", "I'd recommend...", "You might want to...", "Feel free to...", "Hope this helps.", "Sure!", "Of course!", "I'd be happy to help."
+- No greetings, no sign-offs, no filler. Just the answer.
+- Prefer specific over vague: "14 days" not "a while ago", "2:15pm" not "this afternoon", names not "your contact".
+- If you don't have data, say what's missing and offer a next step. Never apologize.
+
+CONFIDENCE RULES (match your phrasing to the evidence strength):
+- High confidence (>80%): state as fact.
+- Medium (50-80%): hedge slightly. "You seem to prefer..."
+- Low (<50%): explicit uncertainty or don't mention.
+- NEVER confidently assert something backed by only 1 observation from 1 source.
+
+OPINION RULES:
+- When the user asks for a recommendation, pick ONE answer with one-sentence defense.
+- Academic deadlines > social follow-ups > nice-to-haves.
+- If user says "options" or "list", THEN give a list. Otherwise, commit.
+- Never hedge with "you could". Say "Do X. Because Y."
+- Centrum Today list items > email items.
+
+FORMATTING:
+- **bold** for entities. {{curly}} for metadata. [Button] for actions.
+- Multi-item: one line each with — separator.
+- >6 lines: truncate with {{...more}}
+- Drafts: text then [Send] [Edit] [Cancel]`
+
+      // Build system as array of content blocks with cache_control
+      const systemBlocks: any[] = isSpotlight ? [
+        // Block 1: IRIS behavior rules — highly stable, cache aggressively
+        {
+          type: 'text',
+          text: IRIS_RULES,
+          cache_control: { type: 'ephemeral' }
+        },
+        // Block 2: Persona + stable context — changes on persona rewrite (~every 15min)
+        {
+          type: 'text',
+          text: `\n\nCONTEXT — this is who you're talking to and what you know:\n${context}`,
+          cache_control: { type: 'ephemeral' }
+        }
+      ] : [
+        { type: 'text', text: `You are Universal AI, a personal AI. Be concise and helpful.\n\n${context}` }
+      ]
+
+      // ── Fire main response (+ parallel second-pass for analytical) ──
+
+      const mainCallPromise = client.messages.create({
+        model: settings.model || 'claude-sonnet-4-20250514',
+        max_tokens: isSpotlight ? 300 : 500,
+        system: systemBlocks,
+        messages: [{ role: 'user', content }]
+      })
+
+      // For analytical queries, fire second-pass in parallel
+      let secondPassPromise: Promise<string | null> | null = null
+      if (isSpotlight && !queryClass.skipSecondPass) {
+        secondPassPromise = runSecondPass({
+          userQuery: content,
+          literalResponse: '', // second-pass runs independently with context only
+          context
+        }).catch(() => null)
+      }
+
+      // Wait for main response
+      const response = await mainCallPromise
+      let text = response.content[0].type === 'text' ? response.content[0].text : ''
+
+      // Log cache performance from response headers
+      const usage = (response as any).usage
+      if (usage) {
+        const cacheRead = usage.cache_read_input_tokens || 0
+        const cacheCreate = usage.cache_creation_input_tokens || 0
+        const totalInput = usage.input_tokens || 0
+        if (cacheRead > 0 || cacheCreate > 0) {
+          console.log(`[cache] Prompt cache: ${cacheRead} read, ${cacheCreate} created, ${totalInput} total input tokens`)
+        }
+      }
+
+      // Merge second-pass result if it ran
+      if (secondPassPromise) {
+        try {
+          const addition = await secondPassPromise
+          if (addition && addition.length > 5 && addition !== 'NONE') {
+            // Verify the addition doesn't repeat content already in the main response
+            const mainWords = new Set(text.toLowerCase().split(/\s+/).filter((w: string) => w.length > 4))
+            const addWords = addition.toLowerCase().split(/\s+/).filter((w: string) => w.length > 4)
+            const overlap = addWords.filter((w: string) => mainWords.has(w)).length
+            const overlapRatio = addWords.length > 0 ? overlap / addWords.length : 1
+
+            if (overlapRatio < 0.5) {
+              text = text + '\n\n' + addition
+            }
+          }
+        } catch {
+          // Second pass failure is non-critical
+        }
+      }
+
+      // Extract entities from response and store in query memory
+      const entities = extractEntitiesFromText(text, content)
+      insertQueryMemory(content, text, entities).catch(() => {})
+
+      res.json({ text })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── GET /api/situation ──────────────────────────────────────
+
+  app.get('/api/situation', async (_req, res) => {
+    try {
+      const contacts = await listContacts(10)
+      const stale = await listStaleThreads(3)
+      const awaiting = await listThreadsAwaitingReply()
+      const upcoming = await listUpcomingEvents(14)
+      const commitments = await listCommitments('active')
+      const recentDocs = await listRecentDocuments(7)
+      const profile = await getLivingProfile()
+      const obsCounts = await getObservationCountBySource()
+
+      res.json({
+        profile: profile?.slice(0, 500) ?? null,
+        contacts: contacts.map((c: any) => ({ name: c.name, email: c.email, score: c.relationship_score })),
+        stale_threads: stale.map((t: any) => ({ subject: t.subject, stale_days: t.stale_days })),
+        awaiting_reply: awaiting.map((t: any) => ({ subject: t.subject, from: t.last_message_from })),
+        upcoming_events: upcoming.map((e: any) => ({ summary: e.summary, start: e.start_time })),
+        commitments: commitments.slice(0, 10).map((c: any) => ({ description: c.description, due: c.due_at })),
+        recent_documents: recentDocs.slice(0, 10).map((d: any) => ({ filename: d.filename, type: d.type })),
+        observation_counts: obsCounts
+      })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── GET /api/briefing ───────────────────────────────────────
+
+  app.get('/api/briefing', async (_req, res) => {
+    try {
+      const settings = await getSettings()
+      const apiKey = settings.api_key || process.env.ANTHROPIC_API_KEY
+      if (!apiKey) { res.status(400).json({ error: 'No API key' }); return }
+
+      const Anthropic = (await import('@anthropic-ai/sdk')).default
+      const client = new Anthropic({ apiKey })
+
+      const profile = await getLivingProfile() ?? ''
+      const stale = await listStaleThreads(3)
+      const upcoming = await listUpcomingEvents(1)
+      const commitments = await listCommitments('active')
+
+      const context = [
+        profile.slice(0, 1500),
+        `Stale: ${stale.slice(0, 3).map((t: any) => t.subject).join('; ')}`,
+        `Events: ${upcoming.slice(0, 3).map((e: any) => e.summary).join('; ') || 'none'}`,
+        `Commitments: ${commitments.slice(0, 3).map((c: any) => c.description.slice(0, 60)).join('; ') || 'none'}`
+      ].join('\n')
+
+      const response = await client.messages.create({
+        model: settings.model || 'claude-sonnet-4-20250514',
+        max_tokens: 400,
+        system: 'You are Universal AI giving a concise daily briefing. Under 75 words. Conversational, not robotic.',
+        messages: [{ role: 'user', content: context }]
+      })
+
+      const text = response.content[0].type === 'text' ? response.content[0].text : ''
+      res.json({ text })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── GET /api/observations ───────────────────────────────────
+
+  app.get('/api/observations', async (req, res) => {
+    const limit = parseInt(req.query.limit as string || '20', 10)
+    const obs = await getRecentObservations(limit)
+    const counts = await getObservationCountBySource()
+    res.json({ observations: obs, counts, total: await totalObservationCount() })
+  })
+
+  // ── GET /api/insights ───────────────────────────────────────
+
+  app.get('/api/insights', async (_req, res) => {
+    const insights = await listInsights('active')
+    res.json({ insights, total: insights.length })
+  })
+
+  // ── GET /api/persona ────────────────────────────────────────
+
+  app.get('/api/persona', async (_req, res) => {
+    const persona = await getLivingProfile()
+    res.json({ persona: persona ?? 'No persona yet', length: persona?.length ?? 0 })
+  })
+
+  // ── GET /api/feed (single endpoint for corner feed panel) ───
+
+  app.get('/api/feed', async (_req, res) => {
+    try {
+      const pool = getPool()
+
+      const [
+        urgentActions,
+        todayActions,
+        ghostActions,
+        routineBreaksRes,
+        relationshipShifts,
+        trendFlags,
+        lifeEventsRecent,
+        personaProfile,
+        obsRate,
+        sourceHealth
+      ] = await Promise.all([
+        // Urgent: predicted actions with urgency critical/high, deduped by title
+        pool.query(`
+          SELECT DISTINCT ON (LOWER(TRIM(title)))
+            id, title, description, action_type, urgency, confidence, draft_content, trigger_context, related_entity
+          FROM predicted_actions WHERE status='pending' AND expires_at > NOW()
+          AND urgency IN ('critical', 'high')
+          ORDER BY LOWER(TRIM(title)), confidence DESC LIMIT 10
+        `),
+        // Today: medium urgency, deduped by title
+        pool.query(`
+          SELECT DISTINCT ON (LOWER(TRIM(title)))
+            id, title, description, action_type, urgency, confidence, draft_content, trigger_context, related_entity
+          FROM predicted_actions WHERE status='pending' AND expires_at > NOW()
+          AND urgency IN ('medium', 'low')
+          ORDER BY LOWER(TRIM(title)), confidence DESC LIMIT 10
+        `),
+        // Ghost: recently expired or low-confidence filtered actions
+        pool.query(`
+          SELECT id, title, description, action_type, confidence, trigger_context
+          FROM predicted_actions WHERE (status='expired' OR confidence < 0.5)
+          AND predicted_at > NOW() - INTERVAL '2 hours'
+          ORDER BY predicted_at DESC LIMIT 10
+        `),
+        // Routine breaks
+        pool.query(`
+          SELECT id, description, expected_behavior, actual_behavior, severity, days_broken, detected_at
+          FROM routine_breaks WHERE detected_at > NOW() - INTERVAL '7 days'
+          ORDER BY detected_at DESC LIMIT 5
+        `),
+        // Relationship shifts (with specific evidence data)
+        pool.query(`
+          SELECT name, current_closeness, trajectory, anomaly, narrative_note,
+                 interaction_freq_30d, whatsapp_msgs_30d, email_count_30d,
+                 initiator_ratio, last_interaction
+          FROM relationships WHERE (trajectory != 'stable' OR anomaly IS NOT NULL)
+          ORDER BY current_closeness DESC LIMIT 10
+        `),
+        // Trend flags
+        pool.query(`
+          SELECT statement FROM insights
+          WHERE id LIKE 'trend-%' AND status='active'
+          ORDER BY last_confirmed DESC LIMIT 5
+        `),
+        // Recent life events
+        pool.query(`
+          SELECT type, summary, confidence, detected_at
+          FROM life_events WHERE detected_at > NOW() - INTERVAL '7 days'
+          ORDER BY detected_at DESC LIMIT 3
+        `),
+        // Persona freshness
+        pool.query("SELECT updated_at, version FROM living_profile WHERE id='main'"),
+        // Observation rate (last hour)
+        pool.query("SELECT COUNT(*)::int as c FROM observations WHERE timestamp > NOW() - INTERVAL '1 hour'"),
+        // Source health (count per source in last hour)
+        pool.query(`
+          SELECT source, COUNT(*)::int as c FROM observations
+          WHERE timestamp > NOW() - INTERVAL '1 hour'
+          GROUP BY source ORDER BY c DESC
+        `)
+      ])
+
+      // Compute persona freshness
+      const personaRow = personaProfile.rows[0]
+      const personaAge = personaRow ? Math.round((Date.now() - new Date(personaRow.updated_at).getTime()) / 60000) : 999
+      const personaFreshness = personaAge < 15 ? 'fresh' : personaAge < 60 ? 'aging' : 'stale'
+
+      // Active chains for urgent items
+      const chainsRes = await pool.query(
+        `SELECT ac.id, ac.trigger_event, cs.step_number, cs.title, cs.description, cs.status
+         FROM action_chains ac JOIN chain_steps cs ON cs.chain_id = ac.id
+         WHERE ac.status = 'active' ORDER BY ac.created_at DESC, cs.step_number LIMIT 15`
+      )
+      const chains: Record<string, any[]> = {}
+      for (const row of chainsRes.rows) {
+        if (!chains[row.id]) chains[row.id] = []
+        chains[row.id].push({ step: row.step_number, title: row.title, description: row.description, status: row.status })
+      }
+
+      // ── PRIORITY SCORING ──────────────────────────────────────────
+      // Score every item 0-100, then take top N per section.
+      // Corner feed should fit one screen: max 3+3+2 = 8 cards total.
+
+      // Load persona text for keyword matching
+      const personaText = (await getLivingProfile() || '').toLowerCase()
+      const topContactNames = relationshipShifts.rows.slice(0, 10).map((r: any) => r.name?.toLowerCase()).filter(Boolean)
+
+      // Score urgent/today actions
+      function scoreAction(a: any): number {
+        let score = 0
+        // Stale days signal (from trigger_context)
+        const staleMatch = (a.trigger_context || '').match(/(\d+)\s*days?\s*stale/i)
+        if (staleMatch) score += Math.min(70, parseInt(staleMatch[1]) * 5)
+        // Top contact bonus
+        const titleLower = (a.title || '').toLowerCase()
+        if (topContactNames.some((n: string) => titleLower.includes(n))) score += 20
+        // Deadline proximity
+        if (a.urgency === 'critical') score += 15
+        // Chain cascade bonus
+        if (a.related_entity && chains[a.related_entity]) score += 10
+        return Math.min(100, score)
+      }
+
+      const scoredUrgent = urgentActions.rows.map((a: any) => ({ ...a, priority_score: scoreAction(a) }))
+        .sort((a: any, b: any) => b.priority_score - a.priority_score)
+      const scoredToday = todayActions.rows.map((a: any) => ({ ...a, priority_score: scoreAction(a) }))
+        .sort((a: any, b: any) => b.priority_score - a.priority_score)
+
+      // Score noticed items
+      const noticedCandidates: any[] = []
+
+      // Routine breaks — filter noisy URL patterns
+      for (const b of routineBreaksRes.rows) {
+        let score = 0
+        const desc = (b.description || '').toLowerCase()
+
+        // Kill generic URL patterns
+        const isGenericUrl = /visits\s+\S+\.\S+\s+most\s+on/i.test(b.description)
+        if (isGenericUrl) { score = 0 } // hard zero for URL visit patterns
+        else {
+          // Person in top contacts
+          if (topContactNames.some((n: string) => desc.includes(n))) score += 30
+          // Project/commitment in persona
+          const personaKeywords = ['extended essay', 'tattva', 'centrum', 'ibdp', 'airpoint', 'chetana', 'kutty olam', 'history ia', 'cas', 'tok']
+          if (personaKeywords.some(k => desc.includes(k))) score += 30
+          // Centrum tracked
+          if (desc.includes('centrum') || desc.includes('today list')) score += 20
+          // Severity-adjusted duration
+          if (b.days_broken > 5) score += 15
+          if (b.severity === 'high') score += 10
+        }
+
+        if (score > 50) {
+          noticedCandidates.push({ type: 'routine_break', text: b.description, detail: `Expected: ${b.expected_behavior}. Actual: ${b.actual_behavior}`, severity: b.severity, days: b.days_broken, score })
+        }
+      }
+
+      // Relationship shifts — specific evidence, not templated
+      for (const r of relationshipShifts.rows) {
+        if (r.trajectory === 'stable' && !r.anomaly) continue
+        let score = 0
+        const inTop10 = r.current_closeness > 25
+
+        if (inTop10 && r.trajectory !== 'stable') score += 50
+        if (r.anomaly === 'sudden_silence' || r.anomaly === 'overdue_followup') score += 20
+        // Trajectory crossed direction
+        if (r.trajectory === 'declining' && r.current_closeness > 30) score += 30
+        if (r.trajectory === 'rising' && r.current_closeness > 40) score += 20
+
+        if (score > 50) {
+          const arrow = r.trajectory === 'rising' ? '↑' : r.trajectory === 'declining' ? '↓' : '→'
+          // Specific evidence from relationship data
+          const freq30 = r.interaction_freq_30d ? `${Math.round(r.interaction_freq_30d * 30)} interactions this month` : ''
+          const lastDays = r.last_interaction ? `${Math.round((Date.now() - new Date(r.last_interaction).getTime()) / 86400000)}d since last contact` : ''
+          const waCount = r.whatsapp_msgs_30d > 0 ? `${r.whatsapp_msgs_30d} WhatsApp msgs` : ''
+          const emailCount = r.email_count_30d > 0 ? `${r.email_count_30d} emails` : ''
+          const initRatio = r.initiator_ratio !== undefined ? `you initiate ${Math.round(r.initiator_ratio * 100)}%` : ''
+
+          const evidenceParts = [freq30, lastDays, waCount, emailCount, initRatio].filter(Boolean)
+          const detail = evidenceParts.length > 0 ? evidenceParts.slice(0, 3).join(', ') : (r.narrative_note || `Trajectory: ${r.trajectory}`)
+
+          // Frame as an insight, not a metric
+          const directionWord = r.trajectory === 'rising' ? 'is rising' : r.trajectory === 'declining' ? 'is fading' : 'shifted'
+          const insightText = `${r.name} ${directionWord} — ${detail.split(',')[0]}`
+          noticedCandidates.push({ type: 'relationship', text: insightText, detail, anomaly: r.anomaly, score })
+        }
+      }
+
+      // Trend flags — only high-delta, persona-relevant
+      for (const t of trendFlags.rows) {
+        let score = 0
+        const stmt = (t.statement || '').toLowerCase()
+        const deltaMatch = stmt.match(/(\d+)%/)
+        const delta = deltaMatch ? parseInt(deltaMatch[1]) : 0
+
+        if (delta > 50) score += 40
+        // Check if subject is in persona priorities
+        const personaKeywords = ['extended essay', 'tattva', 'ibdp', 'software', 'coding', 'whatsapp', 'email']
+        if (personaKeywords.some(k => stmt.includes(k))) score += 20
+        if (delta > 100) score += 15
+
+        if (score > 40) {
+          noticedCandidates.push({ type: 'trend', text: t.statement, score })
+        }
+      }
+
+      // Life events always win
+      for (const e of lifeEventsRecent.rows) {
+        noticedCandidates.push({ type: 'life_event', text: `${e.type}: ${e.summary}`, confidence: e.confidence, detected: e.detected_at, score: 90 })
+      }
+
+      // Sort all noticed by score, take top 2
+      noticedCandidates.sort((a, b) => b.score - a.score)
+      const noticed = noticedCandidates.slice(0, 2)
+      const noticedOverflow = noticedCandidates.length - 2
+
+      // Overflow counts
+      const urgentOverflow = Math.max(0, scoredUrgent.length - 3)
+      const todayOverflow = Math.max(0, scoredToday.length - 3)
+
+      res.json({
+        status: {
+          obsLastHour: obsRate.rows[0]?.c || 0,
+          personaFreshness,
+          personaAgeMinutes: personaAge,
+          personaVersion: personaRow?.version || 0,
+          sourcesActive: sourceHealth.rows.length,
+          sourceBreakdown: sourceHealth.rows.reduce((acc: any, r: any) => { acc[r.source] = r.c; return acc }, {}),
+          lastObservation: new Date().toISOString()
+        },
+        urgent: scoredUrgent.slice(0, 3),
+        urgentOverflow,
+        today: scoredToday.slice(0, 3),
+        todayOverflow,
+        noticed,
+        noticedOverflow: Math.max(0, noticedOverflow),
+        ghost: ghostActions.rows,
+        chains
+      })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── GET /api/actions ────────────────────────────────────────
+
+  app.get('/api/actions', async (req, res) => {
+    const status = req.query.status as string | undefined
+    const actions = await listProposedActions(status)
+    res.json({ actions })
+  })
+
+  // ── POST /api/actions/:id/approve ───────────────────────────
+
+  app.post('/api/actions/:id/approve', async (req, res) => {
+    await updateActionStatus(req.params.id, 'approved')
+    res.json({ ok: true })
+  })
+
+  // ── POST /api/actions/:id/reject ────────────────────────────
+
+  app.post('/api/actions/:id/reject', async (req, res) => {
+    await updateActionStatus(req.params.id, 'rejected')
+    const reason = req.body?.reason || ''
+
+    // Log as correction for active learning
+    const pool = getPool()
+    const action = await pool.query('SELECT title, description FROM proposed_actions WHERE id=$1', [req.params.id])
+    if (action.rows.length > 0) {
+      const a = action.rows[0]
+      insertCorrection(
+        `Proposed action: ${a.title}`,
+        a.description || '',
+        'dismissed',
+        reason,
+        '',
+        []
+      ).catch(() => {})
+      processCorrection(
+        `Proposed: ${a.title} — ${(a.description || '').slice(0, 100)}`,
+        'dismissed',
+        reason || `User dismissed: ${a.title}`,
+        a.description || ''
+      ).catch(() => {})
+    }
+
+    res.json({ ok: true })
+  })
+
+  // ── Cache stats ─────────────────────────────────────────────
+
+  app.get('/api/cache', (_req, res) => {
+    res.json(getCacheStats())
+  })
+
+  app.post('/api/cache/invalidate', (_req, res) => {
+    invalidateCache('manual')
+    res.json({ ok: true })
+  })
+
+  // ── POST /api/observe (external observation ingestion) ──────
+
+  app.post('/api/observe', async (req, res) => {
+    const { source, event_type, content } = req.body
+    if (!source || !event_type || !content) {
+      res.status(400).json({ error: 'source, event_type, content required' })
+      return
+    }
+    const id = await insertObservation(source, event_type, content, {}, 'neutral', [], '')
+
+    // Run life event detector on every observation (async, non-blocking)
+    analyzeForLifeEvent(id, source, event_type, content, new Date().toISOString()).catch(() => {})
+
+    res.json({ id })
+  })
+
+  // ── Predicted actions ──────────────────────────────────────
+
+  app.post('/api/actions/predict', async (_req, res) => {
+    try {
+      const count = await runActionPredictor()
+      res.json({ ok: true, predicted: count })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/actions/predicted', async (req, res) => {
+    try {
+      const limit = parseInt(req.query.limit as string) || 10
+      const actions = await getPendingActions(limit)
+      res.json({ actions })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.post('/api/actions/predicted/:id/serve', async (req, res) => {
+    try {
+      await markActionServed(req.params.id, req.body?.query || '')
+      res.json({ ok: true })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── Chain reasoning ────────────────────────────────────────
+
+  app.post('/api/chains/generate', async (req, res) => {
+    try {
+      const { trigger, trigger_type, trigger_entity } = req.body
+      if (!trigger) { res.status(400).json({ error: 'trigger required' }); return }
+      const result = await generateChain(trigger, trigger_type || 'manual', trigger_entity || null)
+      if (result) {
+        res.json({ ok: true, chain_id: result.chainId, steps: result.steps.length })
+      } else {
+        res.json({ ok: false, reason: 'No chain generated (duplicate or insufficient context)' })
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.post('/api/chains/generate-all', async (_req, res) => {
+    try {
+      const count = await generateChainsForUrgentItems()
+      res.json({ ok: true, chains: count })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/chains', async (req, res) => {
+    try {
+      const limit = parseInt(req.query.limit as string) || 5
+      const chains = await getActiveChains(limit)
+      res.json({ chains })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.post('/api/chains/step/:id/complete', async (req, res) => {
+    try {
+      const result = await completeChainStep(req.params.id)
+      res.json({ ok: true, nextStep: result.nextStep })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── Routines ───────────────────────────────────────────────
+
+  app.post('/api/routines/extract', async (_req, res) => {
+    try {
+      const count = await extractRoutines()
+      const breaks = await detectRoutineBreaks()
+      res.json({ ok: true, routines: count, breaks })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/routines', async (_req, res) => {
+    try {
+      const routines = await getActiveRoutines()
+      const breaks = await getRecentBreaks(10)
+      res.json({ routines, breaks })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── Skills ─────────────────────────────────────────────────
+
+  app.post('/api/skills/extract', async (_req, res) => {
+    try {
+      const count = await extractSkills()
+      res.json({ ok: true, skills: count })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/skills', async (_req, res) => {
+    try {
+      const skills = await getSkills()
+      res.json({ skills })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── Active learning: corrections & lessons ─────────────────
+
+  app.post('/api/correction', async (req, res) => {
+    try {
+      const { trigger, user_action, correction_text, context } = req.body
+      if (!trigger || !user_action) {
+        res.status(400).json({ error: 'trigger and user_action required' })
+        return
+      }
+      const id = await insertCorrection(trigger, context || '', user_action, correction_text || '', '', [])
+      const result = await processCorrection(trigger, user_action, correction_text || '', context || '')
+      res.json({ ok: true, id, ...result })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/corrections', async (_req, res) => {
+    try {
+      const corrections = await getAllCorrections(50)
+      res.json({ corrections })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/lessons', async (_req, res) => {
+    try {
+      const lessons = await getActiveLessons()
+      res.json({ lessons })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── Relationship graph ──────────────────────────────────────
+
+  app.post('/api/relationships/update', async (_req, res) => {
+    try {
+      const count = await runRelationshipEngine()
+      res.json({ ok: true, updated: count })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/relationships', async (req, res) => {
+    try {
+      const limit = parseInt(req.query.limit as string) || 20
+      const rels = await getTopRelationships(limit)
+      res.json({ relationships: rels })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── Persona confidence rewrite ──────────────────────────────
+
+  app.post('/api/persona/rewrite', async (_req, res) => {
+    try {
+      const result = await rewritePersonaWithConfidence()
+      if (result) {
+        res.json({ ok: true, length: result.length })
+      } else {
+        res.json({ ok: false, error: 'Rewrite returned null — check API key and persona' })
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── Life events ────────────────────────────────────────────
+
+  app.get('/api/life-events', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const r = await pool.query('SELECT * FROM life_events ORDER BY detected_at DESC LIMIT 20')
+      res.json({ events: r.rows })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── POST /api/settings ─────────────────────────────────────
+
+  app.post('/api/settings', async (req, res) => {
+    for (const [key, value] of Object.entries(req.body)) {
+      if (typeof value === 'string') await setSetting(key, value)
+    }
+    res.json({ ok: true })
+  })
+
+  // ── GET /api/settings ──────────────────────────────────────
+
+  app.get('/api/settings', async (_req, res) => {
+    const settings = await getSettings()
+    // Mask sensitive values
+    const masked: Record<string, string> = {}
+    for (const [k, v] of Object.entries(settings)) {
+      masked[k] = k.includes('key') || k.includes('secret') || k.includes('token')
+        ? v.slice(0, 8) + '...' + v.slice(-4)
+        : v
+    }
+    res.json(masked)
+  })
+
+  // ── Digest endpoints ────────────────────────────────────────
+
+  app.post('/api/digest/backfill', async (req, res) => {
+    try {
+      const days = parseInt(req.query.days as string) || 30
+      console.log(`[digest] Backfill requested: ${days} days`)
+      const result = await backfillDigests(days)
+      res.json({ ok: true, ...result })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.post('/api/digest/generate', async (req, res) => {
+    try {
+      const { date } = req.body
+      if (!date) { res.status(400).json({ error: 'date required (YYYY-MM-DD)' }); return }
+      const result = await generateDailyDigest(date)
+      res.json({ ok: true, generated: !!result, date })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/digests', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const daily = await pool.query(
+        "SELECT id, timestamp, extracted_entities FROM observations WHERE source='daily_digest' ORDER BY timestamp DESC LIMIT 60"
+      )
+      const weekly = await pool.query(
+        "SELECT id, timestamp, extracted_entities FROM observations WHERE source='weekly_digest' ORDER BY timestamp DESC LIMIT 10"
+      )
+      res.json({
+        daily: daily.rows.map((r: any) => ({
+          id: r.id,
+          timestamp: r.timestamp,
+          ...(typeof r.extracted_entities === 'string' ? JSON.parse(r.extracted_entities) : r.extracted_entities)
+        })),
+        weekly: weekly.rows.map((r: any) => ({
+          id: r.id,
+          timestamp: r.timestamp,
+          ...(typeof r.extracted_entities === 'string' ? JSON.parse(r.extracted_entities) : r.extracted_entities)
+        }))
+      })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── POST /api/trends (run trend analysis) ───────────────────
+
+  app.post('/api/trends', async (_req, res) => {
+    try {
+      const report = await detectTrends()
+      res.json(report)
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/trends', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const r = await pool.query(
+        "SELECT raw_content, extracted_entities, timestamp FROM observations WHERE source='trend_detector' ORDER BY timestamp DESC LIMIT 5"
+      )
+      res.json({ reports: r.rows })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── POST /api/centrum (board snapshot + commitment extraction) ──
+
+  app.post('/api/centrum', async (req, res) => {
+    try {
+      const board = req.body
+      if (!board || !board.cards) { res.status(400).json({ error: 'Invalid board state' }); return }
+
+      // Build cluster summary
+      const cards = board.cards as any[]
+      const clusters = cards.filter((c: any) => c.type === 'cluster')
+      const tasks = cards.filter((c: any) => c.type === 'task')
+      const clusterSummary: Record<string, any> = {}
+
+      for (const cluster of clusters) {
+        const clusterTasks = tasks.filter((t: any) => t.clusterId === cluster.id)
+        const subtasks = clusterTasks.reduce((s: number, t: any) => s + (Array.isArray(t.content) ? t.content.length : 0), 0)
+        const done = clusterTasks.reduce((s: number, t: any) => s + (Array.isArray(t.content) ? t.content.filter((st: any) => st.done).length : 0), 0)
+        clusterSummary[cluster.title] = { cards: clusterTasks.length, subtasks, done }
+      }
+
+      // Build today summary text
+      const todayIds = new Set(board.todayIds || [])
+      const todayDone = new Set(board.todayDone || [])
+      const todayDeferred = board.todayDeferred || {}
+      const todayCards = cards.filter((c: any) => todayIds.has(c.id))
+      const todayLines = todayCards.map((c: any) => {
+        const cluster = clusters.find((cl: any) => cl.id === c.clusterId)?.title || 'Unclustered'
+        const isDone = todayDone.has(c.id)
+        const deferred = todayDeferred[c.id]
+        const subtasks = Array.isArray(c.content) ? c.content : []
+        const doneCount = subtasks.filter((t: any) => t.done).length
+        let line = `${isDone ? '✅' : '⬜'} ${c.title} [${cluster}]`
+        if (subtasks.length > 0) line += ` (${doneCount}/${subtasks.length})`
+        if (deferred) line += ` [deferred${deferred.date ? ' to ' + deferred.date : ''}]`
+        return line
+      })
+      const todaySummary = `TODAY (${todayDone.size}/${todayIds.size} done):\n${todayLines.join('\n')}`
+
+      // Store snapshot
+      const snapId = await insertCentrumSnapshot(board, clusterSummary, todaySummary)
+
+      // Extract commitments from Centrum cards
+      let commitCount = 0
+      for (const card of tasks) {
+        const cluster = clusters.find((cl: any) => cl.id === card.clusterId)?.title || 'Unclustered'
+        const subtasks = Array.isArray(card.content) ? card.content : []
+        const isToday = todayIds.has(card.id)
+        const isDone = todayDone.has(card.id)
+
+        // Every card in Today that isn't done → active commitment
+        if (isToday && !isDone) {
+          await upsertCommitment(
+            `centrum-${card.id}`,
+            `${card.title} [${cluster}]`,
+            'centrum', card.id, null, null, 'active', 0.9
+          )
+          commitCount++
+        }
+
+        // Every undone subtask in a Today card → commitment
+        if (isToday && subtasks.length > 0) {
+          for (const st of subtasks) {
+            if (!st.done) {
+              const stId = `centrum-${card.id}-${st.text?.slice(0, 30).replace(/[^a-zA-Z0-9]/g, '_')}`
+              await upsertCommitment(
+                stId,
+                `${st.text} (in "${card.title}" [${cluster}])`,
+                'centrum', card.id, null, null, 'active', 0.85
+              )
+              commitCount++
+            }
+          }
+        }
+      }
+
+      // Mark centrum commitments not in current board as completed
+      const pool = getPool()
+      const existing = await pool.query("SELECT id, source_ref FROM commitments WHERE source_type='centrum' AND status='active'")
+      const activeCardIds = new Set(tasks.map((t: any) => t.id))
+      for (const row of existing.rows) {
+        if (row.source_ref && !activeCardIds.has(row.source_ref) && !todayIds.has(row.source_ref)) {
+          await pool.query("UPDATE commitments SET status='completed' WHERE id=$1", [row.id])
+        }
+      }
+
+      console.log(`[centrum] Snapshot ${snapId}: ${cards.length} cards, ${commitCount} commitments extracted`)
+      res.json({ ok: true, snapshot_id: snapId, cards: cards.length, commitments_extracted: commitCount, clusters: clusterSummary })
+    } catch (err: any) {
+      console.error('[centrum] Error:', err.message)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── POST /api/import (bulk data migration from local SQLite) ──
+
+  app.post('/api/import', async (req, res) => {
+    try {
+      const { contacts, email_threads, calendar_events, commitments, insights, living_profile } = req.body
+      const pool = getPool()
+      const counts: Record<string, number> = {}
+
+      if (contacts?.length) {
+        for (const c of contacts) {
+          await pool.query(
+            `INSERT INTO contacts (id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (email) DO UPDATE SET
+             name=$2, emails_sent=$4, emails_received=$5, relationship_score=$6, last_interaction_at=$7`,
+            [c.id, c.name, c.email, c.emails_sent || 0, c.emails_received || 0, c.relationship_score || 0, c.last_interaction_at]
+          )
+        }
+        counts.contacts = contacts.length
+      }
+
+      if (email_threads?.length) {
+        for (const t of email_threads) {
+          await pool.query(
+            `INSERT INTO email_threads (thread_id, subject, last_message_from, last_message_date, awaiting_reply, stale_days, participants, message_count)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (thread_id) DO UPDATE SET
+             subject=$2, last_message_from=$3, last_message_date=$4, awaiting_reply=$5, stale_days=$6, participants=$7, message_count=$8`,
+            [t.thread_id, t.subject, t.last_message_from, t.last_message_date, t.awaiting_reply, t.stale_days, t.participants, t.message_count]
+          )
+        }
+        counts.email_threads = email_threads.length
+      }
+
+      if (calendar_events?.length) {
+        for (const e of calendar_events) {
+          await pool.query(
+            `INSERT INTO calendar_events (id, summary, start_time, end_time, all_day, location, participants, recurring, status, calendar_name)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO UPDATE SET
+             summary=$2, start_time=$3, end_time=$4, all_day=$5, location=$6, participants=$7, recurring=$8, status=$9, calendar_name=$10`,
+            [e.id, e.summary, e.start_time, e.end_time, e.all_day, e.location, e.participants, e.recurring, e.status, e.calendar_name]
+          )
+        }
+        counts.calendar_events = calendar_events.length
+      }
+
+      if (commitments?.length) {
+        for (const c of commitments) {
+          await pool.query(
+            `INSERT INTO commitments (id, description, source_type, source_ref, committed_to, committed_by, due_at, status, ai_confidence)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO UPDATE SET
+             description=$2, source_type=$3, source_ref=$4, committed_to=$5, committed_by=$6, due_at=$7, status=$8, ai_confidence=$9`,
+            [c.id, c.description, c.source_type, c.source_ref, c.committed_to, c.committed_by, c.due_at, c.status, c.ai_confidence]
+          )
+        }
+        counts.commitments = commitments.length
+      }
+
+      if (insights?.length) {
+        for (const i of insights) {
+          await pool.query(
+            `INSERT INTO insights (id, statement, evidence, confidence, category, status, source_count, times_confirmed)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET
+             statement=$2, evidence=$3, confidence=$4, category=$5, status=$6, source_count=$7, times_confirmed=$8`,
+            [i.id, i.statement, i.evidence, i.confidence, i.category, i.status, i.source_count, i.times_confirmed]
+          )
+        }
+        counts.insights = insights.length
+      }
+
+      if (req.body.documents?.length) {
+        for (const d of req.body.documents) {
+          await pool.query(
+            `INSERT INTO documents (id, path, filename, type, summary, tags, size_bytes, last_modified)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET
+             path=$2, filename=$3, type=$4, summary=$5, tags=$6, size_bytes=$7, last_modified=$8`,
+            [d.id, d.path, d.filename, d.type, d.summary || '', d.tags || '[]', d.size_bytes || 0, d.last_modified]
+          )
+        }
+        counts.documents = req.body.documents.length
+      }
+
+      if (living_profile) {
+        await setLivingProfile(living_profile)
+        counts.living_profile = 1
+      }
+
+      console.log('[import] Migration complete:', counts)
+      res.json({ ok: true, counts })
+    } catch (err: any) {
+      console.error('[import] Error:', err.message)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── WebSocket: /ws/glasses ──────────────────────────────────
+
+  const server = createServer(app)
+
+  const wss = new WebSocketServer({ noServer: true })
+
+  server.on('upgrade', (request, socket, head) => {
+    if (request.url === '/ws/glasses') {
+      // Check auth for WebSocket
+      const url = new URL(request.url, `http://localhost`)
+      const token = request.headers.authorization?.replace('Bearer ', '') ||
+                    new URLSearchParams(url.search).get('token')
+      if (token !== ACCESS_TOKEN && ACCESS_TOKEN) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
+        socket.destroy()
+        return
+      }
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request)
+      })
+    } else {
+      socket.destroy()
+    }
+  })
+
+  let connectedDevices = 0
+
+  wss.on('connection', (ws: WebSocket) => {
+    connectedDevices++
+    console.log(`[ws] Device connected (${connectedDevices} total)`)
+    ws.send(JSON.stringify({ type: 'ready', version: '0.1.0-cloud' }))
+
+    ws.on('close', () => {
+      connectedDevices--
+      console.log(`[ws] Device disconnected (${connectedDevices} total)`)
+    })
+
+    ws.on('message', async (data: Buffer) => {
+      // Same binary protocol as Electron version
+      if (!Buffer.isBuffer(data) || data.length < 1) return
+      const op = data[0]
+      const payload = data.length > 1 ? data.subarray(1) : Buffer.alloc(0)
+
+      try {
+        if (op === 0x04 && payload.length === 0) {
+          // Briefing request
+          const settings = await getSettings()
+          const apiKey = settings.api_key || process.env.ANTHROPIC_API_KEY || ''
+          if (!apiKey) { ws.send(JSON.stringify({ error: 'No API key' })); return }
+
+          const Anthropic = (await import('@anthropic-ai/sdk')).default
+          const client = new Anthropic({ apiKey })
+          const profile = await getLivingProfile() ?? ''
+
+          const response = await client.messages.create({
+            model: settings.model || 'claude-sonnet-4-20250514',
+            max_tokens: 300,
+            system: 'Concise daily briefing. Under 60 words. Conversational.',
+            messages: [{ role: 'user', content: profile.slice(0, 1500) }]
+          })
+
+          const text = response.content[0].type === 'text' ? response.content[0].text : ''
+          ws.send(JSON.stringify({ type: 'response', mode: 'briefing', text }))
+        }
+      } catch (err: any) {
+        ws.send(JSON.stringify({ error: err.message }))
+      }
+    })
+  })
+
+  // ── Update /health with device count ────────────────────────
+
+  app.get('/health', async (_req, res) => {
+    const obsCount = await totalObservationCount()
+    const profile = await getLivingProfile()
+    res.json({
+      status: 'ok',
+      version: '0.1.0-cloud',
+      connected_devices: connectedDevices,
+      observations: obsCount,
+      persona_length: profile?.length ?? 0,
+      persona_last_updated: 'see /api/persona',
+      uptime: Math.floor(process.uptime())
+    })
+  })
+
+  // ── Start ───────────────────────────────────────────────────
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`\n${'='.repeat(60)}`)
+    console.log(`  Universal AI Cloud Server`)
+    console.log(`  http://0.0.0.0:${PORT}`)
+    console.log(`  WebSocket: ws://0.0.0.0:${PORT}/ws/glasses`)
+    console.log(`  Access Token: ${ACCESS_TOKEN.slice(0, 12)}...`)
+    console.log(`${'='.repeat(60)}\n`)
+
+    // Start nightly digest scheduler (00:15 IST)
+    startDigestScheduler()
+
+    // Periodic WiFi history cleanup for location detection (every hour)
+    setInterval(cleanupWifiHistory, 3600_000)
+
+    // Relationship engine — run hourly
+    setTimeout(() => {
+      runRelationshipEngine().catch(err => console.error('[relationships] Initial run failed:', err.message))
+    }, 30_000)
+    setInterval(() => {
+      runRelationshipEngine().catch(err => console.error('[relationships] Hourly run failed:', err.message))
+    }, 3600_000)
+
+    // Action predictor — run every 10 minutes
+    setTimeout(() => {
+      runActionPredictor().catch(err => console.error('[predictor] Initial run failed:', err.message))
+    }, 20_000) // 20s after startup
+    setInterval(() => {
+      runActionPredictor().catch(err => console.error('[predictor] Periodic run failed:', err.message))
+    }, 10 * 60_000) // every 10 minutes
+
+    // Skill extraction — run on startup + weekly
+    setTimeout(() => {
+      extractSkills().catch(err => console.error('[skills] Initial extraction failed:', err.message))
+    }, 60_000) // 60s after startup
+    setInterval(() => {
+      extractSkills().catch(err => console.error('[skills] Weekly extraction failed:', err.message))
+    }, 7 * 24 * 3600_000) // weekly
+
+    // Routine extraction — run on startup + daily, exception detection hourly
+    setTimeout(async () => {
+      try {
+        await extractRoutines()
+        await detectRoutineBreaks()
+      } catch (err: any) {
+        console.error('[routines] Initial extraction failed:', err.message)
+      }
+    }, 45_000) // 45s after startup
+    setInterval(() => {
+      detectRoutineBreaks().catch(err => console.error('[routines] Exception detection failed:', err.message))
+    }, 3600_000) // hourly exception checks
+  })
+}
+
+main().catch((err) => {
+  console.error('Fatal:', err)
+  process.exit(1)
+})
