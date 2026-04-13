@@ -2646,7 +2646,7 @@ FORMATTING:
       body: JSON.stringify({
         model_id: 'sonic-2',
         transcript: text.slice(0, 5000),
-        voice: { mode: 'id', id: '87286a8d-7ea7-4235-a41a-dd9fa6630feb' },
+        voice: { mode: 'id', id: '4f7f1324-1853-48a6-b294-4e78e8036a83' },
         output_format: { container: 'raw', sample_rate: 16000, encoding: 'pcm_s16le' }
       })
     })
