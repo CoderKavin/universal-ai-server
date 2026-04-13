@@ -1667,28 +1667,88 @@ FORMATTING:
   app.post('/api/overlay/evaluate', async (req, res) => {
     try {
       const pool = getPool()
-      const { ocr_text, app: appName, window_title } = req.body
-      if (!ocr_text || ocr_text.length < 20) return res.json({ show: false })
+      const { ocr_text, app: appName, window_title, url, file_path, mode } = req.body
 
-      const textLower = ocr_text.toLowerCase()
+      // ── UPGRADE 8: Multi-signal matching ───────────────────────
+      const signals = {
+        ocr: (ocr_text || '').toLowerCase(),
+        title: (window_title || '').toLowerCase(),
+        url: (url || '').toLowerCase(),
+        file: (file_path || '').toLowerCase(),
+        app: (appName || '').toLowerCase()
+      }
+      const allText = `${signals.ocr} ${signals.title} ${signals.url} ${signals.file}`.toLowerCase()
+
+      // Detect compose/create state (used by multiple matchers)
+      const isCompose = signals.title.includes('compose') || signals.title.includes('new message') ||
+                        signals.url.includes('/compose') || signals.url.includes('mail.google.com/mail') ||
+                        signals.ocr.includes('compose') || signals.ocr.includes('new message') ||
+                        signals.ocr.includes('reply') || signals.app.includes('mail')
+      const isEditor = signals.app.includes('code') || signals.app.includes('docs') ||
+                       signals.app.includes('word') || signals.app.includes('pages') ||
+                       signals.app.includes('notion') || signals.app.includes('obsidian')
+
       const insights: any[] = []
 
-      // ── Matcher 1: Contact name → actionable pending items ──
+      // Load contacts once (shared across matchers)
       const contacts = await pool.query(
         `SELECT name, email, current_closeness, trajectory, anomaly, last_interaction,
                 interaction_freq_30d, whatsapp_msgs_30d, email_count_30d
          FROM relationships WHERE current_closeness > 15 ORDER BY current_closeness DESC LIMIT 20`
       )
-      for (const c of contacts.rows) {
-        const nameLower = (c.name || '').toLowerCase()
-        if (nameLower.length < 3 || !textLower.includes(nameLower)) continue
 
-        // Gate 3: only if there's an actionable pending item
+      // ── UPGRADE 1: Predictive pre-staging ──────────────────────
+      // If compose state with no clear recipient yet, predict what they'll do
+      const isBlankCompose = isCompose && signals.ocr.length < 100 &&
+        !contacts.rows.some((c: any) => allText.includes((c.name || '').toLowerCase()))
+
+      if (isBlankCompose) {
+        // Find the most likely next action based on stale threads + pending actions
+        const likelyAction = await pool.query(
+          `SELECT pa.title, pa.description, pa.trigger_context, pa.related_entity, pa.action_type
+           FROM predicted_actions pa
+           WHERE pa.status = 'pending' AND pa.expires_at > NOW()
+           AND pa.action_type IN ('follow_up_draft', 'relationship_maintenance')
+           ORDER BY pa.confidence DESC LIMIT 1`
+        )
+        if (likelyAction.rows.length > 0) {
+          const la = likelyAction.rows[0]
+          const name = (la.title || '').replace(/^(Follow up:|Reach out to)\s*/i, '').slice(0, 25)
+          insights.push({
+            type: 'predictive', label: 'PREDICTION',
+            title: `Probably replying to ${name}`,
+            body: la.draft_content ? 'Draft ready' : (la.trigger_context || '').slice(0, 50),
+            confidence: 76,
+            entity_id: la.related_entity || name,
+            button: la.draft_content ? 'Use Draft' : 'View',
+            action_type: la.draft_content ? 'use_draft' : 'view',
+            upgrade: 'predictive'
+          })
+        }
+      }
+
+      // ── Multi-signal entity matching function ──────────────────
+      // UPGRADE 8: requires match in 2+ signals for high confidence
+      function entityConfidence(name: string): number {
+        const nameLower = name.toLowerCase()
+        if (nameLower.length < 3) return 0
+        let hits = 0
+        if (signals.ocr.includes(nameLower)) hits++
+        if (signals.title.includes(nameLower)) hits++
+        if (signals.url.includes(nameLower.replace(/\s/g, ''))) hits++
+        // Boost for multi-signal agreement
+        return hits === 0 ? 0 : hits >= 2 ? 90 : 70
+      }
+
+      // ── Matcher 1: Contact name → actionable pending items ──
+      for (const c of contacts.rows) {
+        const conf = entityConfidence(c.name || '')
+        if (conf === 0) continue
+
         const pendingAction = await pool.query(
-          `SELECT id, title, trigger_context FROM predicted_actions
+          `SELECT id, title, trigger_context, draft_content FROM predicted_actions
            WHERE status = 'pending' AND expires_at > NOW()
-           AND (title ILIKE $1 OR related_entity ILIKE $2)
-           LIMIT 1`,
+           AND (title ILIKE $1 OR related_entity ILIKE $2) LIMIT 1`,
           [`%${c.name}%`, `%${c.email}%`]
         )
         if (pendingAction.rows.length > 0) {
@@ -1697,17 +1757,14 @@ FORMATTING:
             type: 'contact', label: 'CONTACT',
             title: `${c.name}: pending action`,
             body: (pa.trigger_context || pa.title || '').slice(0, 80),
-            confidence: 80,
-            entity_id: c.email
+            confidence: conf, entity_id: c.email
           })
           continue
         }
 
-        // Gate 3: unaddressed recent message (last interaction within 2 days, stale thread)
         const staleThread = await pool.query(
           `SELECT thread_id, subject, stale_days FROM email_threads
-           WHERE participants LIKE $1 AND stale_days >= 3
-           ORDER BY stale_days DESC LIMIT 1`,
+           WHERE participants LIKE $1 AND stale_days >= 3 ORDER BY stale_days DESC LIMIT 1`,
           [`%${c.email}%`]
         )
         if (staleThread.rows.length > 0) {
@@ -1715,25 +1772,21 @@ FORMATTING:
             type: 'contact', label: 'EMAIL',
             title: `Stale thread with ${c.name}`,
             body: `"${(staleThread.rows[0].subject || '').slice(0, 50)}" — ${staleThread.rows[0].stale_days}d no reply`,
-            confidence: 75,
-            entity_id: c.email
+            confidence: conf - 5, entity_id: c.email
           })
         }
       }
 
       // ── Matcher 2: Calendar event approaching ──
-      if (appName?.toLowerCase().includes('calendar') || textLower.includes('calendar')) {
+      if (signals.app.includes('calendar') || allText.includes('calendar')) {
         const upcoming = await pool.query(
           `SELECT id, summary, start_time, participants FROM calendar_events
            WHERE start_time::timestamptz > NOW() AND start_time::timestamptz < NOW() + INTERVAL '2 hours'
-           AND status != 'cancelled' AND all_day = 0
-           ORDER BY start_time::timestamptz LIMIT 3`
+           AND status != 'cancelled' AND all_day = 0 ORDER BY start_time::timestamptz LIMIT 3`
         )
         for (const ev of upcoming.rows) {
-          const evNameLower = (ev.summary || '').toLowerCase()
-          if (!textLower.includes(evNameLower) && evNameLower.length > 5) continue
-
-          // Gate 3: participant is a tracked contact with context
+          const evName = (ev.summary || '').toLowerCase()
+          if (!allText.includes(evName) && evName.length > 5) continue
           const participants = JSON.parse(ev.participants || '[]')
           const contactMatch = contacts.rows.find((c: any) =>
             participants.some((p: string) => p.toLowerCase().includes((c.name || '').toLowerCase()))
@@ -1744,22 +1797,18 @@ FORMATTING:
               type: 'calendar', label: 'MEETING',
               title: `${(ev.summary || '').slice(0, 40)} in ${minsLeft}m`,
               body: `${contactMatch.name} — ${contactMatch.trajectory || 'stable'} relationship`,
-              confidence: 78,
-              entity_id: ev.id
+              confidence: 78, entity_id: ev.id
             })
           }
         }
       }
 
-      // ── Matcher 3: Email compose (recipient in OCR) ──
-      const isCompose = textLower.includes('compose') || textLower.includes('new message') ||
-                        textLower.includes('reply') || (appName?.toLowerCase().includes('mail'))
-      if (isCompose) {
+      // ── Matcher 3: Email compose with recipient ──
+      if (isCompose && !isBlankCompose) {
         for (const c of contacts.rows) {
-          const nameLower = (c.name || '').toLowerCase()
-          if (nameLower.length < 3 || !textLower.includes(nameLower)) continue
+          const conf = entityConfidence(c.name || '')
+          if (conf === 0) continue
 
-          // Gate 3: deadline/commitment involving this contact
           const commitment = await pool.query(
             `SELECT description, due_at FROM commitments
              WHERE status = 'active' AND (committed_to ILIKE $1 OR committed_by ILIKE $1)
@@ -1773,26 +1822,21 @@ FORMATTING:
               type: 'email', label: 'COMMITMENT',
               title: `Open commitment with ${c.name}`,
               body: `${(cm.description || '').slice(0, 60)}${dueInfo}`,
-              confidence: 82,
-              entity_id: c.email,
-              button: 'View',
-              action_type: 'view'
+              confidence: Math.min(conf + 5, 95), entity_id: c.email,
+              button: 'View', action_type: 'view'
             })
             break
           }
 
-          // Gate 3: relationship trajectory shift
           if (c.anomaly === 'sudden_silence' || c.anomaly === 'overdue_followup') {
             const daysSince = c.last_interaction
-              ? Math.round((Date.now() - new Date(c.last_interaction).getTime()) / 86400000)
-              : 0
+              ? Math.round((Date.now() - new Date(c.last_interaction).getTime()) / 86400000) : 0
             if (daysSince >= 7) {
               insights.push({
                 type: 'email', label: 'RELATIONSHIP',
                 title: `${c.name} — ${daysSince}d since last contact`,
                 body: c.anomaly === 'sudden_silence' ? 'Unusual silence detected' : 'Follow-up overdue',
-                confidence: 72,
-                entity_id: c.email
+                confidence: conf - 5, entity_id: c.email
               })
               break
             }
@@ -1800,22 +1844,24 @@ FORMATTING:
         }
       }
 
-      // ── Matcher 4: File/document (tracked doc name in OCR) ──
-      if (appName?.toLowerCase().includes('code') || appName?.toLowerCase().includes('docs') ||
-          appName?.toLowerCase().includes('word') || appName?.toLowerCase().includes('pages')) {
+      // ── Matcher 4: File/document ──
+      if (isEditor) {
         const recentDocs = await pool.query(
           `SELECT id, filename, path, summary, last_modified FROM documents
-           WHERE last_modified > NOW() - INTERVAL '30 days'
-           ORDER BY last_modified DESC LIMIT 20`
+           WHERE last_modified > NOW() - INTERVAL '30 days' ORDER BY last_modified DESC LIMIT 20`
         )
         for (const doc of recentDocs.rows) {
           const fnLower = (doc.filename || '').toLowerCase()
-          if (fnLower.length < 4 || !textLower.includes(fnLower)) continue
+          if (fnLower.length < 4) continue
+          // UPGRADE 8: check across all signals
+          const inOcr = signals.ocr.includes(fnLower)
+          const inTitle = signals.title.includes(fnLower)
+          const inFile = signals.file.includes(fnLower)
+          const hits = [inOcr, inTitle, inFile].filter(Boolean).length
+          if (hits === 0) continue
 
-          // Gate 3: related commitment or deadline
           const relCommitment = await pool.query(
-            `SELECT description FROM commitments WHERE status = 'active'
-             AND description ILIKE $1 LIMIT 1`,
+            `SELECT description FROM commitments WHERE status = 'active' AND description ILIKE $1 LIMIT 1`,
             [`%${doc.filename.slice(0, 20)}%`]
           )
           if (relCommitment.rows.length > 0) {
@@ -1823,47 +1869,184 @@ FORMATTING:
               type: 'file', label: 'DOCUMENT',
               title: doc.filename.slice(0, 40),
               body: `Related: ${(relCommitment.rows[0].description || '').slice(0, 60)}`,
-              confidence: 73,
-              entity_id: doc.id
+              confidence: 65 + hits * 10, entity_id: doc.id
             })
           }
         }
       }
 
       // ── Matcher 5: Centrum card ──
-      if (textLower.includes('centrum') || textLower.includes('spoika') || textLower.includes('today list')) {
-        // Check for chains related to visible content
+      if (allText.includes('centrum') || allText.includes('spoika') || allText.includes('today list')) {
         const chains = await pool.query(
           `SELECT ac.id, ac.trigger_event, COUNT(cs.id)::int as pending
            FROM action_chains ac JOIN chain_steps cs ON cs.chain_id = ac.id AND cs.status = 'pending'
-           WHERE ac.status = 'active'
-           GROUP BY ac.id HAVING COUNT(cs.id) >= 2
-           LIMIT 3`
+           WHERE ac.status = 'active' GROUP BY ac.id HAVING COUNT(cs.id) >= 2 LIMIT 3`
         )
         for (const ch of chains.rows) {
           const triggerLower = (ch.trigger_event || '').toLowerCase()
-          // Only show if the chain topic is visible on screen
           const words = triggerLower.split(/\s+/).filter((w: string) => w.length > 4)
-          const matchedWords = words.filter((w: string) => textLower.includes(w))
+          const matchedWords = words.filter((w: string) => allText.includes(w))
           if (matchedWords.length >= 2) {
             insights.push({
               type: 'centrum', label: 'CHAIN PLAN',
               title: (ch.trigger_event || '').slice(0, 45),
               body: `${ch.pending} steps pending`,
-              confidence: 76,
-              entity_id: ch.id,
-              button: 'View Chain',
-              action_type: 'view_chain'
+              confidence: 76, entity_id: ch.id,
+              button: 'View Chain', action_type: 'view_chain'
             })
           }
         }
       }
 
-      // Pick highest confidence insight
+      // ── UPGRADE 4: Intent inference from activity sequence ─────
+      if (mode === 'proactive' || insights.length === 0) {
+        const recentActivity = await pool.query(
+          `SELECT source, event_type, raw_content FROM observations
+           WHERE timestamp > NOW() - INTERVAL '10 minutes'
+           ORDER BY timestamp DESC LIMIT 15`
+        )
+        if (recentActivity.rows.length >= 3) {
+          // Look for focused topic across recent activity
+          const activityText = recentActivity.rows.map((r: any) => r.raw_content || '').join(' ').toLowerCase()
+          // Find topics that appear in 3+ recent observations
+          const topicCandidates = contacts.rows.filter((c: any) =>
+            (c.name || '').length > 3 && activityText.split(c.name.toLowerCase()).length > 2
+          )
+          for (const topic of topicCandidates) {
+            const pa = await pool.query(
+              `SELECT title, trigger_context FROM predicted_actions
+               WHERE status = 'pending' AND expires_at > NOW()
+               AND (title ILIKE $1 OR related_entity ILIKE $2) LIMIT 1`,
+              [`%${topic.name}%`, `%${topic.email}%`]
+            )
+            if (pa.rows.length > 0) {
+              insights.push({
+                type: 'sequence', label: 'PATTERN',
+                title: `You're focused on ${topic.name}`,
+                body: (pa.rows[0].trigger_context || pa.rows[0].title || '').slice(0, 60),
+                confidence: 72, entity_id: topic.email,
+                upgrade: 'sequence'
+              })
+              break
+            }
+          }
+        }
+      }
+
+      // ── UPGRADE 6: Proactive time-based triggering ─────────────
+      if (mode === 'proactive') {
+        // Check for approaching calendar events needing prep
+        const soonEvents = await pool.query(
+          `SELECT id, summary, start_time, participants FROM calendar_events
+           WHERE start_time::timestamptz > NOW() + INTERVAL '5 minutes'
+           AND start_time::timestamptz < NOW() + INTERVAL '30 minutes'
+           AND status != 'cancelled' AND all_day = 0 LIMIT 1`
+        )
+        if (soonEvents.rows.length > 0) {
+          const ev = soonEvents.rows[0]
+          const minsLeft = Math.round((new Date(ev.start_time).getTime() - Date.now()) / 60000)
+          insights.push({
+            type: 'proactive', label: 'UPCOMING',
+            title: `${(ev.summary || '').slice(0, 40)} in ${minsLeft}m`,
+            body: 'No prep detected — review now?',
+            confidence: 78, entity_id: ev.id,
+            button: 'View', action_type: 'view',
+            upgrade: 'proactive'
+          })
+        }
+
+        // Check for stale high-priority commitments
+        const urgentCommitments = await pool.query(
+          `SELECT description, due_at, committed_to FROM commitments
+           WHERE status = 'active' AND due_at IS NOT NULL
+           AND due_at::text <= $1 ORDER BY due_at LIMIT 1`,
+          [new Date(Date.now() + 24 * 3600000).toISOString().slice(0, 10)]
+        )
+        if (urgentCommitments.rows.length > 0) {
+          const uc = urgentCommitments.rows[0]
+          insights.push({
+            type: 'proactive', label: 'DEADLINE',
+            title: `Due ${uc.due_at}: ${(uc.description || '').slice(0, 35)}`,
+            body: uc.committed_to ? `For ${uc.committed_to}` : 'Review before deadline',
+            confidence: 80, entity_id: `commitment:${uc.description?.slice(0, 20)}`,
+            upgrade: 'proactive'
+          })
+        }
+      }
+
       if (insights.length === 0) return res.json({ show: false })
 
       insights.sort((a, b) => b.confidence - a.confidence)
-      const best = insights[0]
+      let best = insights[0]
+
+      // ── UPGRADE 3: Cross-source enrichment ─────────────────────
+      if (best.entity_id) {
+        const entitySearch = best.entity_id
+        // Check calendar for upcoming events with this entity
+        const calMatch = await pool.query(
+          `SELECT summary, start_time FROM calendar_events
+           WHERE start_time::timestamptz > NOW() AND start_time::timestamptz < NOW() + INTERVAL '7 days'
+           AND (summary ILIKE $1 OR participants ILIKE $1) AND status != 'cancelled'
+           ORDER BY start_time::timestamptz LIMIT 1`,
+          [`%${entitySearch.split('@')[0].split(':').pop()?.slice(0, 15)}%`]
+        )
+        // Check chains for this entity
+        const chainMatch = await pool.query(
+          `SELECT ac.trigger_event, cs.title as step_title, cs2.title as step2_title, cs3.title as step3_title
+           FROM action_chains ac
+           LEFT JOIN chain_steps cs ON cs.chain_id = ac.id AND cs.step_number = 1
+           LEFT JOIN chain_steps cs2 ON cs2.chain_id = ac.id AND cs2.step_number = 2
+           LEFT JOIN chain_steps cs3 ON cs3.chain_id = ac.id AND cs3.step_number = 3
+           WHERE ac.status = 'active'
+           AND (ac.trigger_event ILIKE $1 OR ac.trigger_entity ILIKE $2)
+           LIMIT 1`,
+          [`%${entitySearch.split('@')[0].split(':').pop()?.slice(0, 15)}%`, `%${entitySearch}%`]
+        )
+
+        // UPGRADE 7: Attach chain hint
+        if (chainMatch.rows.length > 0) {
+          const ch = chainMatch.rows[0]
+          const steps = [ch.step_title, ch.step2_title, ch.step3_title].filter(Boolean)
+          if (steps.length >= 2) {
+            const chainHint = steps.map((s: string) => s.slice(0, 20)).join(' → ')
+            best.chain_hint = chainHint
+          }
+        }
+
+        // UPGRADE 3: Add calendar context if it enriches
+        if (calMatch.rows.length > 0) {
+          const calEv = calMatch.rows[0]
+          const daysUntil = Math.round((new Date(calEv.start_time).getTime() - Date.now()) / 86400000)
+          if (daysUntil <= 3 && !best.body.includes(calEv.summary)) {
+            best.body = `${calEv.summary} in ${daysUntil}d. ${best.body}`.slice(0, 90)
+            best.confidence = Math.min(best.confidence + 5, 95)
+          }
+        }
+      }
+
+      // ── UPGRADE 5: Pattern comparison (past similar items) ─────
+      if (best.entity_id && best.type !== 'predictive') {
+        const pastSimilar = await pool.query(
+          `SELECT trigger_action, trigger_context, user_action, correction_text
+           FROM correction_log
+           WHERE trigger_context ILIKE $1 AND timestamp > NOW() - INTERVAL '30 days'
+           ORDER BY timestamp DESC LIMIT 3`,
+          [`%${best.entity_id.split('@')[0].split(':').pop()?.slice(0, 12)}%`]
+        )
+        const dismissed = pastSimilar.rows.filter((r: any) => r.user_action?.includes('dismiss'))
+        if (dismissed.length >= 2 && pastSimilar.rows.length >= 3) {
+          // Past pattern: user dismisses this type — lower confidence
+          best.confidence -= 15
+        }
+        const acted = pastSimilar.rows.filter((r: any) => r.user_action?.includes('acted'))
+        if (acted.length >= 2) {
+          // Past pattern: user acts on this type — boost confidence
+          best.confidence += 5
+        }
+      }
+
+      // Final confidence gate
+      if (best.confidence < 65) return res.json({ show: false })
 
       // Ensure total content < 140 chars
       const totalLen = (best.label || '').length + (best.title || '').length + (best.body || '').length
