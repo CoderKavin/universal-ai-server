@@ -104,8 +104,8 @@ export async function runDriveSync(account: AccountType = 'primary'): Promise<{ 
       ].filter(Boolean).join('\n')
 
       await pool.query(
-        `INSERT INTO observations (id, source, event_type, raw_content) VALUES ($1, $4, $2, $3)`,
-        [crypto.randomUUID(), isNew ? 'created' : 'modified', content, obsSource]
+        `INSERT INTO observations (id, source, event_type, raw_content) VALUES ($1, $2, $3, $4)`,
+        [crypto.randomUUID(), obsSource, isNew ? 'created' : 'modified', content]
       )
 
       newCount++

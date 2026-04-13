@@ -443,7 +443,7 @@ If NO real commitments exist, return []. Return ONLY valid JSON.`,
           messages: [{ role: 'user', content: batchText }]
         })
 
-        const raw = response.content[0].type === 'text' ? response.content[0].text : '[]'
+        const raw = response.content?.[0]?.type === 'text' ? response.content[0].text : '[]'
         try {
           const jsonMatch = raw.match(/\[[\s\S]*\]/)
           if (jsonMatch) {
@@ -451,6 +451,7 @@ If NO real commitments exist, return []. Return ONLY valid JSON.`,
             for (const item of items) {
               if (!item.description) continue
               const emailIdx = (item.email_index ?? 1) - 1
+              if (emailIdx < 0 || emailIdx >= batch.length) continue
               const sourceEmail = batch[emailIdx]
 
               await pool.query(

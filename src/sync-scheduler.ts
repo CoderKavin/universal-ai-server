@@ -74,15 +74,13 @@ export function stopSyncScheduler(): void {
 
 export async function triggerSync(service?: 'gmail' | 'calendar' | 'drive', account?: AccountType): Promise<void> {
   if (account) {
-    // Sync specific account
-    if (!service || service === 'gmail') safeSyncAccount('gmail', account)
-    if (!service || service === 'calendar') safeSyncAccount('calendar', account)
-    if (!service || service === 'drive') safeSyncAccount('drive', account)
+    if (!service || service === 'gmail') await safeSyncAccount('gmail', account)
+    if (!service || service === 'calendar') await safeSyncAccount('calendar', account)
+    if (!service || service === 'drive') await safeSyncAccount('drive', account)
   } else {
-    // Sync all accounts
-    if (!service || service === 'gmail') safeSyncAll('gmail')
-    if (!service || service === 'calendar') safeSyncAll('calendar')
-    if (!service || service === 'drive') safeSyncAll('drive')
+    if (!service || service === 'gmail') await safeSyncAll('gmail')
+    if (!service || service === 'calendar') await safeSyncAll('calendar')
+    if (!service || service === 'drive') await safeSyncAll('drive')
   }
 }
 
