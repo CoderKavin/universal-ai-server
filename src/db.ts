@@ -189,6 +189,34 @@ export async function migrate(): Promise<void> {
       );
       CREATE INDEX IF NOT EXISTS idx_qmem_ts ON query_memory(timestamp DESC);
 
+      CREATE TABLE IF NOT EXISTS whisper_log (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        severity TEXT NOT NULL DEFAULT 'normal',
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        subtitle TEXT,
+        trigger_context TEXT,
+        trigger_data JSONB DEFAULT '{}',
+        actions JSONB DEFAULT '[]',
+        fired_at TIMESTAMPTZ DEFAULT NOW(),
+        user_action TEXT,
+        action_at TIMESTAMPTZ,
+        time_to_action_ms INTEGER,
+        suppressed BOOLEAN DEFAULT FALSE,
+        suppressed_reason TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_whisper_log_fired ON whisper_log(fired_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_whisper_log_type ON whisper_log(type, fired_at DESC);
+
+      CREATE TABLE IF NOT EXISTS whisper_suppressions (
+        id TEXT PRIMARY KEY,
+        trigger_hash TEXT NOT NULL,
+        whisper_type TEXT NOT NULL,
+        suppressed_until TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
       CREATE INDEX IF NOT EXISTS idx_obs_timestamp ON observations(timestamp DESC);
       CREATE INDEX IF NOT EXISTS idx_obs_source ON observations(source);
       CREATE INDEX IF NOT EXISTS idx_calendar_start ON calendar_events(start_time);

@@ -743,12 +743,38 @@ FORMATTING:
       const personaText = (await getLivingProfile() || '').toLowerCase()
       const topContactNames = relationshipShifts.rows.slice(0, 10).map((r: any) => r.name?.toLowerCase()).filter(Boolean)
 
+      // Build relationship lookup for enriching TODAY cards
+      const relLookup = new Map<string, any>()
+      for (const r of relationshipShifts.rows) {
+        if (r.name) relLookup.set(r.name.toLowerCase(), r)
+      }
+
+      // Enrich TODAY relationship cards with specific evidence (same as NOTICED)
+      for (const a of todayActions.rows) {
+        if (a.action_type === 'relationship_maintenance') {
+          const name = (a.title || '').replace(/^Reach out to /i, '').trim()
+          const rel = relLookup.get(name.toLowerCase())
+          if (rel) {
+            const freq30 = rel.interaction_freq_30d ? `${Math.round(rel.interaction_freq_30d * 30)} interactions this month` : ''
+            const lastDays = rel.last_interaction ? `${Math.round((Date.now() - new Date(rel.last_interaction).getTime()) / 86400000)}d since last contact` : ''
+            const waCount = rel.whatsapp_msgs_30d > 0 ? `${rel.whatsapp_msgs_30d} WhatsApp msgs` : ''
+            const emailCount = rel.email_count_30d > 0 ? `${rel.email_count_30d} emails` : ''
+            const initRatio = rel.initiator_ratio !== undefined ? `you initiate ${Math.round(rel.initiator_ratio * 100)}%` : ''
+            const parts = [freq30, lastDays, waCount, emailCount, initRatio].filter(Boolean)
+            if (parts.length > 0) a.trigger_context = parts.slice(0, 3).join(', ')
+          }
+        }
+      }
+
       // Score urgent/today actions
       function scoreAction(a: any): number {
         let score = 0
-        // Stale days signal (from trigger_context)
+        // Stale days signal (from trigger_context — e.g. "stale for 16 days")
         const staleMatch = (a.trigger_context || '').match(/(\d+)\s*days?\s*stale/i)
         if (staleMatch) score += Math.min(70, parseInt(staleMatch[1]) * 5)
+        // Days since last contact (enriched relationship cards — e.g. "15d since last contact")
+        const contactMatch = (a.trigger_context || '').match(/(\d+)d since last contact/)
+        if (contactMatch) score += Math.min(30, parseInt(contactMatch[1]) * 2)
         // Top contact bonus
         const titleLower = (a.title || '').toLowerCase()
         if (topContactNames.some((n: string) => titleLower.includes(n))) score += 20
@@ -763,6 +789,7 @@ FORMATTING:
         .sort((a: any, b: any) => b.priority_score - a.priority_score)
       const scoredToday = todayActions.rows.map((a: any) => ({ ...a, priority_score: scoreAction(a) }))
         .sort((a: any, b: any) => b.priority_score - a.priority_score)
+        .filter((a: any) => a.priority_score >= 25)
 
       // Score noticed items
       const noticedCandidates: any[] = []
@@ -852,9 +879,9 @@ FORMATTING:
       const noticed = noticedCandidates.slice(0, 2)
       const noticedOverflow = noticedCandidates.length - 2
 
-      // Overflow counts
+      // Overflow counts (TODAY capped at 3 to keep feed scannable)
       const urgentOverflow = Math.max(0, scoredUrgent.length - 3)
-      const todayOverflow = Math.max(0, scoredToday.length - 3)
+      const todayOverflow = Math.min(3, Math.max(0, scoredToday.length - 3))
 
       res.json({
         status: {
@@ -1248,6 +1275,525 @@ FORMATTING:
     }
   })
 
+  // ── WHISPER NOTIFICATIONS ────────────────────────────────────────
+
+  app.post('/api/whispers/check', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const now = new Date()
+      const nowISO = now.toISOString()
+
+      // ── Rate limit check ──────────────────────────────────────
+      const rlRes = await pool.query(`SELECT * FROM settings WHERE key IN ('whisper_daily_count','whisper_daily_reset','whisper_hourly_count','whisper_hourly_reset','whisper_last_at','whisper_daily_limit','whisper_tomorrow_reduction')`)
+      const rl: Record<string, string> = {}
+      for (const r of rlRes.rows) rl[r.key] = r.value
+
+      const dailyLimit = parseInt(rl.whisper_daily_limit || '5')
+      const tomorrowReduction = parseInt(rl.whisper_tomorrow_reduction || '0')
+      const effectiveLimit = Math.max(1, dailyLimit - tomorrowReduction)
+
+      // Reset daily counter if new day
+      const dailyReset = rl.whisper_daily_reset ? new Date(rl.whisper_daily_reset) : new Date(0)
+      let dailyCount = parseInt(rl.whisper_daily_count || '0')
+      if (now.toDateString() !== dailyReset.toDateString()) {
+        dailyCount = 0
+        await pool.query(`INSERT INTO settings (key, value) VALUES ('whisper_daily_count', '0') ON CONFLICT (key) DO UPDATE SET value = '0'`)
+        await pool.query(`INSERT INTO settings (key, value) VALUES ('whisper_daily_reset', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [nowISO])
+        // Clear yesterday's reduction
+        if (tomorrowReduction > 0) {
+          await pool.query(`INSERT INTO settings (key, value) VALUES ('whisper_tomorrow_reduction', '0') ON CONFLICT (key) DO UPDATE SET value = '0'`)
+        }
+      }
+
+      // Reset hourly counter
+      const hourlyReset = rl.whisper_hourly_reset ? new Date(rl.whisper_hourly_reset) : new Date(0)
+      let hourlyCount = parseInt(rl.whisper_hourly_count || '0')
+      if (now.getTime() - hourlyReset.getTime() > 3600000) {
+        hourlyCount = 0
+        await pool.query(`INSERT INTO settings (key, value) VALUES ('whisper_hourly_count', '0') ON CONFLICT (key) DO UPDATE SET value = '0'`)
+        await pool.query(`INSERT INTO settings (key, value) VALUES ('whisper_hourly_reset', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [nowISO])
+      }
+
+      // 15-min cooldown
+      const lastWhisperAt = rl.whisper_last_at ? new Date(rl.whisper_last_at) : new Date(0)
+      const cooldownOk = now.getTime() - lastWhisperAt.getTime() > 900000 // 15 min
+
+      // ── Gather trigger candidates ─────────────────────────────
+      const candidates: any[] = []
+
+      // 1. Life events (confidence > 80)
+      const lifeEvents = await pool.query(
+        `SELECT * FROM life_events WHERE confidence > 0.8 AND detected_at > NOW() - INTERVAL '2 hours' ORDER BY detected_at DESC LIMIT 3`
+      )
+      for (const le of lifeEvents.rows) {
+        const severity = le.confidence > 0.9 ? 'critical' : 'normal'
+        const ago = Math.round((now.getTime() - new Date(le.detected_at).getTime()) / 60000)
+        candidates.push({
+          type: 'life_event',
+          severity,
+          body: `Life event: ${(le.summary || '').slice(0, 65)}`,
+          subtitle: `detected · ${ago}m ago`,
+          trigger_hash: `life_event:${le.id}`,
+          trigger_data: { life_event_id: le.id, type: le.type, confidence: le.confidence },
+          actions: [{ label: 'View', action: 'view' }, { label: 'Dismiss', action: 'dismiss' }]
+        })
+      }
+
+      // 2. Chain cascade alerts (3+ pending steps = cascade risk)
+      const chains = await pool.query(`
+        SELECT ac.id, ac.trigger_event, ac.trigger_entity, COUNT(cs.id)::int as pending_steps
+        FROM action_chains ac
+        JOIN chain_steps cs ON cs.chain_id = ac.id AND cs.status = 'pending'
+        WHERE ac.status = 'active' AND ac.created_at > NOW() - INTERVAL '72 hours'
+        GROUP BY ac.id HAVING COUNT(cs.id) >= 3
+        LIMIT 2
+      `)
+      for (const c of chains.rows) {
+        candidates.push({
+          type: 'chain_cascade',
+          severity: 'high',
+          body: `Chain risk: ${(c.trigger_event || '').slice(0, 60)}`,
+          subtitle: `${c.pending_steps} steps at risk`,
+          trigger_hash: `chain:${c.id}`,
+          trigger_data: { chain_id: c.id, pending_steps: c.pending_steps },
+          actions: [{ label: 'View Chain', action: 'view_chain' }, { label: 'Dismiss', action: 'dismiss' }]
+        })
+      }
+
+      // 3. Critical deadline crossing (<30 min to calendar event)
+      const thirtyMin = new Date(now.getTime() + 30 * 60000).toISOString()
+      const deadlines = await pool.query(
+        `SELECT * FROM calendar_events WHERE start_time::timestamptz > $1::timestamptz AND start_time::timestamptz < $2::timestamptz AND status != 'cancelled' AND all_day = 0 LIMIT 3`,
+        [nowISO, thirtyMin]
+      )
+      for (const ev of deadlines.rows) {
+        const minsLeft = Math.round((new Date(ev.start_time).getTime() - now.getTime()) / 60000)
+        candidates.push({
+          type: 'deadline',
+          severity: minsLeft < 15 ? 'high' : 'normal',
+          body: `${(ev.summary || 'Event').slice(0, 50)} starts in ${minsLeft} minutes`,
+          subtitle: `Calendar · ${ev.calendar_name || 'primary'}`,
+          trigger_hash: `deadline:${ev.id}`,
+          trigger_data: { event_id: ev.id, summary: ev.summary, minutes_left: minsLeft },
+          actions: [{ label: 'Snooze 15min', action: 'snooze_15' }, { label: 'Open Calendar', action: 'open_calendar' }]
+        })
+      }
+
+      // 4. Priority contact urgent signal
+      const topContacts = await pool.query(`SELECT name, email, last_interaction, current_closeness FROM relationships ORDER BY current_closeness DESC LIMIT 5`)
+      const top3 = topContacts.rows.slice(0, 3)
+      const top5Names = topContacts.rows.map((r: any) => r.name?.toLowerCase()).filter(Boolean)
+      const top3Names = top3.map((r: any) => r.name?.toLowerCase()).filter(Boolean)
+
+      // Check for urgency keywords in recent observations from top 5
+      if (top5Names.length > 0) {
+        const urgentObs = await pool.query(
+          `SELECT * FROM observations WHERE source IN ('email','whatsapp') AND timestamp > NOW() - INTERVAL '1 hour' AND (raw_content ILIKE '%urgent%' OR raw_content ILIKE '%ASAP%' OR raw_content ILIKE '%deadline%' OR raw_content ILIKE '%by EOD%' OR raw_content ILIKE '%important%') ORDER BY timestamp DESC LIMIT 5`
+        )
+        for (const obs of urgentObs.rows) {
+          const content = (obs.raw_content || '').toLowerCase()
+          const matchedContact = top5Names.find((n: string) => content.includes(n))
+          if (matchedContact) {
+            const ago = Math.round((now.getTime() - new Date(obs.timestamp).getTime()) / 60000)
+            candidates.push({
+              type: 'priority_contact',
+              severity: 'normal',
+              body: `${matchedContact.split(' ').map((w: string) => w[0].toUpperCase() + w.slice(1)).join(' ')} sent an urgent message`,
+              subtitle: `via ${obs.source} · ${ago}m ago`,
+              trigger_hash: `priority_contact:${obs.id}`,
+              trigger_data: { observation_id: obs.id, contact: matchedContact, source: obs.source },
+              actions: [{ label: 'Reply', action: 'reply' }, { label: 'View Thread', action: 'view' }]
+            })
+          }
+        }
+
+        // Top 3 contacts after 48h silence
+        for (const c of top3) {
+          if (!c.last_interaction) continue
+          const hoursSinceContact = (now.getTime() - new Date(c.last_interaction).getTime()) / 3600000
+          if (hoursSinceContact >= 48) {
+            // Check if they sent something in the last hour
+            const recentMsg = await pool.query(
+              `SELECT id, source, timestamp FROM observations WHERE source IN ('email','whatsapp') AND timestamp > NOW() - INTERVAL '1 hour' AND raw_content ILIKE $1 LIMIT 1`,
+              [`%${c.name}%`]
+            )
+            if (recentMsg.rows.length > 0) {
+              const ago = Math.round((now.getTime() - new Date(recentMsg.rows[0].timestamp).getTime()) / 60000)
+              candidates.push({
+                type: 'priority_contact',
+                severity: 'high',
+                body: `${c.name} reached out after ${Math.round(hoursSinceContact / 24)}d of silence`,
+                subtitle: `via ${recentMsg.rows[0].source} · ${ago}m ago`,
+                trigger_hash: `priority_silence:${c.email}:${recentMsg.rows[0].id}`,
+                trigger_data: { contact: c.name, email: c.email, hours_silent: hoursSinceContact },
+                actions: [{ label: 'Reply', action: 'reply' }, { label: 'View Thread', action: 'view' }]
+              })
+            }
+          }
+        }
+      }
+
+      // 5. Severe routine break (3+ days, confidence > 80, severity > 0.7)
+      const routineBreaks = await pool.query(`
+        SELECT rb.*, r.confidence as routine_confidence
+        FROM routine_breaks rb
+        JOIN routines r ON r.id = rb.routine_id
+        WHERE r.confidence > 0.8 AND rb.days_broken >= 3
+        AND rb.detected_at > NOW() - INTERVAL '24 hours'
+        ORDER BY rb.days_broken DESC LIMIT 2
+      `)
+      for (const rb of routineBreaks.rows) {
+        // Parse severity as float — stored as text like 'high','medium','low' or float
+        const sevVal = rb.severity === 'high' ? 0.9 : rb.severity === 'medium' ? 0.5 : rb.severity === 'low' ? 0.3 : parseFloat(rb.severity) || 0.3
+        if (sevVal > 0.7) {
+          candidates.push({
+            type: 'routine_break',
+            severity: 'normal',
+            body: `${(rb.description || '').slice(0, 55)} — ${rb.days_broken}d break`,
+            subtitle: `routine confidence ${Math.round(rb.routine_confidence * 100)}%`,
+            trigger_hash: `routine_break:${rb.id}`,
+            trigger_data: { routine_break_id: rb.id, days_broken: rb.days_broken },
+            actions: [{ label: 'View', action: 'view' }, { label: 'Dismiss', action: 'dismiss' }]
+          })
+        }
+      }
+
+      // 6. Trend threshold alert (delta > 50%, persona top-3 priority)
+      const personaText = (await getLivingProfile() || '').toLowerCase()
+      const trendInsights = await pool.query(`SELECT * FROM insights WHERE id LIKE 'trend-%' AND status = 'active' ORDER BY last_confirmed DESC LIMIT 5`)
+      for (const t of trendInsights.rows) {
+        const stmt = (t.statement || '').toLowerCase()
+        const deltaMatch = stmt.match(/(\d+)%/)
+        const delta = deltaMatch ? parseInt(deltaMatch[1]) : 0
+        if (delta <= 50) continue
+
+        // Check if relates to persona top priorities
+        const priorityKeywords = ['extended essay', 'tattva', 'ibdp', 'software', 'coding', 'iris']
+        const relatesTopPriority = priorityKeywords.some(k => stmt.includes(k))
+        if (!relatesTopPriority) continue
+
+        candidates.push({
+          type: 'trend_alert',
+          severity: 'normal',
+          body: `Trend: ${(t.statement || '').slice(0, 70)}`,
+          subtitle: `${delta}% change detected`,
+          trigger_hash: `trend:${t.id}`,
+          trigger_data: { trend_id: t.id, delta },
+          actions: [{ label: 'View', action: 'view' }, { label: 'Dismiss', action: 'dismiss' }]
+        })
+      }
+
+      // 7. Stale thread hitting cascade threshold
+      const staleThreads = await pool.query(`
+        SELECT pa.id, pa.title, pa.trigger_context, pa.related_entity
+        FROM predicted_actions pa
+        WHERE pa.action_type = 'follow_up_draft' AND pa.status = 'pending' AND pa.expires_at > NOW()
+        ORDER BY pa.confidence DESC LIMIT 5
+      `)
+      for (const st of staleThreads.rows) {
+        // Check if there's an active chain depending on this thread
+        const relatedChain = await pool.query(
+          `SELECT ac.id FROM action_chains ac WHERE ac.status = 'active' AND (ac.trigger_entity = $1 OR ac.trigger_event ILIKE $2) LIMIT 1`,
+          [st.related_entity || '', `%${(st.title || '').slice(0, 30)}%`]
+        )
+        if (relatedChain.rows.length > 0) {
+          candidates.push({
+            type: 'stale_thread',
+            severity: 'normal',
+            body: `Stale: ${(st.title || '').replace(/^Follow up: /i, '').slice(0, 55)} — blocks chain`,
+            subtitle: `${st.trigger_context?.match(/(\d+)\s*days?/)?.[0] || 'overdue'}`,
+            trigger_hash: `stale_thread:${st.id}`,
+            trigger_data: { action_id: st.id, chain_id: relatedChain.rows[0].id },
+            actions: [{ label: 'Approve Follow-up', action: 'approve' }, { label: 'Snooze', action: 'snooze' }]
+          })
+        }
+      }
+
+      // ── Apply filters ─────────────────────────────────────────
+      // Clean expired suppressions
+      await pool.query(`DELETE FROM whisper_suppressions WHERE suppressed_until < NOW()`)
+
+      const readyWhispers: any[] = []
+
+      for (const c of candidates) {
+        // FILTER 1: Dedup — same trigger in last 4 hours?
+        const recent = await pool.query(
+          `SELECT id FROM whisper_log WHERE trigger_context = $1 AND fired_at > NOW() - INTERVAL '4 hours' AND suppressed = false LIMIT 1`,
+          [c.trigger_hash]
+        )
+        if (recent.rows.length > 0) continue
+
+        // FILTER 2: Suppression list
+        const suppressed = await pool.query(
+          `SELECT id FROM whisper_suppressions WHERE trigger_hash = $1 AND suppressed_until > NOW() LIMIT 1`,
+          [c.trigger_hash]
+        )
+        if (suppressed.rows.length > 0) continue
+
+        // FILTER 3: Dismissed this type 3+ times in 7 days (active learning)
+        if (c.severity !== 'critical') {
+          const dismissals = await pool.query(
+            `SELECT COUNT(*)::int as c FROM whisper_log WHERE type = $1 AND user_action = 'dismiss' AND fired_at > NOW() - INTERVAL '7 days'`,
+            [c.type]
+          )
+          if (dismissals.rows[0].c >= 3) continue
+        }
+
+        // FILTER 4: Rate limits (severity=critical bypasses daily limit but still counts)
+        if (c.severity !== 'critical') {
+          if (dailyCount >= effectiveLimit) continue
+          if (hourlyCount >= 2) continue
+          if (!cooldownOk) continue
+        } else {
+          // Critical past daily limit: fire anyway, reduce tomorrow
+          if (dailyCount >= effectiveLimit) {
+            await pool.query(
+              `INSERT INTO settings (key, value) VALUES ('whisper_tomorrow_reduction', $1) ON CONFLICT (key) DO UPDATE SET value = $1`,
+              [String(tomorrowReduction + 1)]
+            )
+          }
+        }
+
+        // Build whisper object
+        const whisperObj = {
+          id: crypto.randomUUID(),
+          type: c.type,
+          severity: c.severity,
+          title: 'IRIS',
+          body: c.body.slice(0, 80),
+          subtitle: c.subtitle || '',
+          actions: c.actions || [],
+          trigger_context: c.trigger_hash,
+          trigger_data: c.trigger_data || {}
+        }
+
+        readyWhispers.push(whisperObj)
+
+        // Update rate limit counters
+        dailyCount++
+        hourlyCount++
+
+        // Stop after first whisper per check (respect 15-min cooldown spirit)
+        break
+      }
+
+      res.json({ whispers: readyWhispers })
+    } catch (err: any) {
+      console.error('[whispers] Check failed:', err.message)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.post('/api/whispers/fired', async (req, res) => {
+    try {
+      const pool = getPool()
+      const { id, type, severity, body, subtitle, trigger_context, trigger_data, actions } = req.body
+
+      // Log the whisper
+      await pool.query(
+        `INSERT INTO whisper_log (id, type, severity, title, body, subtitle, trigger_context, trigger_data, actions)
+         VALUES ($1, $2, $3, 'IRIS', $4, $5, $6, $7, $8)`,
+        [id, type, severity, body, subtitle || '', trigger_context || '', JSON.stringify(trigger_data || {}), JSON.stringify(actions || [])]
+      )
+
+      // Update rate limit counters
+      const nowISO = new Date().toISOString()
+      await pool.query(`INSERT INTO settings (key, value) VALUES ('whisper_last_at', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [nowISO])
+      await pool.query(`INSERT INTO settings (key, value) VALUES ('whisper_daily_count', (COALESCE((SELECT value::int FROM settings WHERE key = 'whisper_daily_count'), 0) + 1)::text) ON CONFLICT (key) DO UPDATE SET value = (COALESCE(settings.value::int, 0) + 1)::text`)
+      await pool.query(`INSERT INTO settings (key, value) VALUES ('whisper_hourly_count', (COALESCE((SELECT value::int FROM settings WHERE key = 'whisper_hourly_count'), 0) + 1)::text) ON CONFLICT (key) DO UPDATE SET value = (COALESCE(settings.value::int, 0) + 1)::text`)
+
+      res.json({ ok: true })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.post('/api/whispers/action', async (req, res) => {
+    try {
+      const pool = getPool()
+      const { whisper_id, action, time_to_action_ms } = req.body
+
+      await pool.query(
+        `UPDATE whisper_log SET user_action = $1, action_at = NOW(), time_to_action_ms = $2 WHERE id = $3`,
+        [action, time_to_action_ms || 0, whisper_id]
+      )
+
+      // If snoozed, add to suppressions
+      if (action === 'snooze' || action === 'snooze_15') {
+        const whisper = await pool.query(`SELECT trigger_context, type FROM whisper_log WHERE id = $1`, [whisper_id])
+        if (whisper.rows.length > 0) {
+          const duration = action === 'snooze_15' ? 15 : 60 // minutes
+          const until = new Date(Date.now() + duration * 60000).toISOString()
+          await pool.query(
+            `INSERT INTO whisper_suppressions (id, trigger_hash, whisper_type, suppressed_until) VALUES ($1, $2, $3, $4)`,
+            [crypto.randomUUID(), whisper.rows[0].trigger_context, whisper.rows[0].type, until]
+          )
+        }
+      }
+
+      // If dismissed, log to correction_log for active learning
+      if (action === 'dismiss') {
+        const whisper = await pool.query(`SELECT type, trigger_context, trigger_data, body FROM whisper_log WHERE id = $1`, [whisper_id])
+        if (whisper.rows.length > 0) {
+          const w = whisper.rows[0]
+          await pool.query(
+            `INSERT INTO correction_log (id, trigger_action, trigger_context, user_action, correction_text, reasoning_chain, affected_claims)
+             VALUES ($1, $2, $3, 'dismissed_whisper', $4, '', '[]')`,
+            [crypto.randomUUID(), `whisper:${w.type}`, w.trigger_context || '', `User dismissed whisper: ${w.body}`]
+          )
+        }
+      }
+
+      res.json({ ok: true })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/whispers/history', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const history = await pool.query(
+        `SELECT * FROM whisper_log WHERE fired_at > NOW() - INTERVAL '7 days' ORDER BY fired_at DESC LIMIT 50`
+      )
+      res.json({ whispers: history.rows })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── GOOGLE SYNC (server-side) ─────────────────────────────────
+
+  app.post('/api/google/connect', async (req, res) => {
+    try {
+      const { refresh_token, email, google_client_id, google_client_secret } = req.body
+      if (!refresh_token || !email) return res.status(400).json({ error: 'refresh_token and email required' })
+
+      const pool = getPool()
+      // Store client credentials in settings
+      if (google_client_id) await pool.query(`INSERT INTO settings (key, value) VALUES ('google_client_id', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [google_client_id])
+      if (google_client_secret) await pool.query(`INSERT INTO settings (key, value) VALUES ('google_client_secret', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [google_client_secret])
+
+      // Validate token by doing a refresh
+      const clientId = google_client_id || (await pool.query(`SELECT value FROM settings WHERE key = 'google_client_id'`)).rows[0]?.value
+      const clientSecret = google_client_secret || (await pool.query(`SELECT value FROM settings WHERE key = 'google_client_secret'`)).rows[0]?.value
+
+      const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ refresh_token, client_id: clientId, client_secret: clientSecret, grant_type: 'refresh_token' })
+      })
+
+      if (!tokenRes.ok) return res.status(400).json({ error: 'Token refresh failed — invalid credentials' })
+
+      const tokens = await tokenRes.json() as { access_token: string; expires_in?: number }
+      const expiryDate = tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : null
+
+      await pool.query(
+        `INSERT INTO oauth_tokens (provider, access_token, refresh_token, expiry_date, email, updated_at)
+         VALUES ('google', $1, $2, $3, $4, NOW())
+         ON CONFLICT (provider) DO UPDATE SET access_token=$1, refresh_token=$2, expiry_date=$3, email=$4, updated_at=NOW()`,
+        [tokens.access_token, refresh_token, expiryDate, email]
+      )
+
+      // Start sync scheduler if not already running
+      const { startSyncScheduler } = await import('./sync-scheduler')
+      startSyncScheduler()
+
+      res.json({ ok: true, email })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.post('/api/google/disconnect', async (_req, res) => {
+    try {
+      const pool = getPool()
+      await pool.query(`DELETE FROM oauth_tokens WHERE provider = 'google'`)
+      const { stopSyncScheduler } = await import('./sync-scheduler')
+      stopSyncScheduler()
+      res.json({ ok: true })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/google/status', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const tokenRes = await pool.query(`SELECT email FROM oauth_tokens WHERE provider = 'google'`)
+      const connected = tokenRes.rows.length > 0
+      const email = tokenRes.rows[0]?.email || null
+
+      const syncRes = await pool.query(`SELECT integration, last_sync_at, status, total_processed FROM sync_state WHERE integration IN ('gmail', 'calendar', 'drive')`)
+      const syncs: Record<string, any> = {}
+      for (const r of syncRes.rows) syncs[r.integration] = { last_sync: r.last_sync_at, status: r.status, total: r.total_processed }
+
+      res.json({ connected, email, ...syncs })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.post('/api/sync/trigger', async (req, res) => {
+    try {
+      const service = req.body?.service as string | undefined
+      const { triggerSync } = await import('./sync-scheduler')
+      await triggerSync(service as any)
+      const { getSyncStatus } = await import('./sync-scheduler')
+      const status = await getSyncStatus()
+      res.json({ ok: true, triggered: service || 'all', status })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/sync/status', async (_req, res) => {
+    try {
+      const { getSyncStatus } = await import('./sync-scheduler')
+      const status = await getSyncStatus()
+      res.json(status)
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.post('/api/gmail/send', async (req, res) => {
+    try {
+      const { to, subject, body } = req.body
+      if (!to || !subject) return res.status(400).json({ error: 'to and subject required' })
+      const { sendEmail } = await import('./gmail-sync')
+      const messageId = await sendEmail(to, subject, body || '')
+      res.json({ ok: true, messageId })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.post('/api/gmail/trash', async (req, res) => {
+    try {
+      const { messageId } = req.body
+      if (!messageId) return res.status(400).json({ error: 'messageId required' })
+      const { trashMessage } = await import('./gmail-sync')
+      const ok = await trashMessage(messageId)
+      res.json({ ok })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.post('/api/calendar/create', async (req, res) => {
+    try {
+      const { summary, startTime, endTime, description } = req.body
+      if (!summary || !startTime || !endTime) return res.status(400).json({ error: 'summary, startTime, endTime required' })
+      const { createCalendarEvent } = await import('./calendar-sync')
+      const eventId = await createCalendarEvent(summary, startTime, endTime, description)
+      res.json({ ok: true, eventId })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
   // ── POST /api/centrum (board snapshot + commitment extraction) ──
 
   app.post('/api/centrum', async (req, res) => {
@@ -1572,6 +2118,11 @@ FORMATTING:
     setInterval(() => {
       detectRoutineBreaks().catch(err => console.error('[routines] Exception detection failed:', err.message))
     }, 3600_000) // hourly exception checks
+
+    // Google sync scheduler — Gmail 10m, Calendar 15m, Drive 15m
+    import('./sync-scheduler').then(({ startSyncScheduler }) => {
+      startSyncScheduler()
+    }).catch(err => console.error('[sync-scheduler] Failed to start:', err.message))
   })
 }
 
