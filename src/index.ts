@@ -204,6 +204,75 @@ async function main(): Promise<void> {
     })
   })
 
+  // ── Screen context helper for spotlight ─────────────────────
+
+  async function getScreenContext(query: string): Promise<string> {
+    try {
+      const pool = getPool()
+
+      // Only inject screen context if query seems to reference "this" or current context
+      const lower = query.toLowerCase()
+      const needsScreen = /\bthis\b|\bit\b|\bthe\b.*\b(email|doc|card|page|file|event|message|thread)\b|\bwhat('s| is) on\b|\bhelp me (with|reply|respond|write|draft|summarize)\b|\bcurrent\b|\bscreen\b|\blooking at\b/i.test(lower)
+
+      if (!needsScreen) return ''
+
+      const screenObs = await pool.query(
+        `SELECT raw_content, timestamp FROM observations WHERE source = 'screen_capture' ORDER BY timestamp DESC LIMIT 1`
+      )
+      const appObs = await pool.query(
+        `SELECT raw_content, timestamp FROM observations WHERE source = 'app_activity' ORDER BY timestamp DESC LIMIT 1`
+      )
+
+      const screen = screenObs.rows[0]
+      const appActivity = appObs.rows[0]
+
+      if (!screen) return ''
+
+      // Freshness gate: only inject if < 30 seconds old
+      const age = Date.now() - new Date(screen.timestamp).getTime()
+      if (age > 30_000) return ''
+
+      // Parse app name
+      let focusedApp = ''
+      let windowTitle = ''
+      if (appActivity?.raw_content) {
+        const m = appActivity.raw_content.match(/(?:Switched to|App):\s*(.+?)(?:\s*—\s*(.+))?$/)
+        if (m) { focusedApp = m[1]?.trim() || ''; windowTitle = m[2]?.trim() || '' }
+      }
+
+      // Parse OCR text
+      let ocrText = ''
+      if (screen.raw_content) {
+        const parts = screen.raw_content.split('Text:\n')
+        ocrText = (parts[1] || screen.raw_content).slice(0, 500)
+      }
+
+      // Detect entities
+      const entities: string[] = []
+      if (ocrText.length > 20) {
+        const contacts = await pool.query(
+          `SELECT name FROM relationships WHERE current_closeness > 15 ORDER BY current_closeness DESC LIMIT 15`
+        )
+        for (const c of contacts.rows) {
+          if (c.name?.length > 3 && ocrText.toLowerCase().includes(c.name.toLowerCase())) {
+            entities.push(c.name)
+          }
+        }
+      }
+
+      const sections = [
+        `The user is currently looking at ${focusedApp || 'unknown app'}${windowTitle ? ` — "${windowTitle}"` : ''}.`,
+        ocrText ? `Visible content on screen: "${ocrText.slice(0, 300)}"` : '',
+        entities.length > 0 ? `Detected people/entities: ${entities.join(', ')}` : '',
+        `When the user says "this", "it", or references something without specifying, they mean what's on this screen.`
+      ].filter(Boolean)
+
+      return `\n\nCURRENT SCREEN CONTEXT (live, ${Math.round(age / 1000)}s ago):\n${sections.join('\n')}`
+    } catch {
+      return ''
+    }
+  }
+
   // ── POST /api/chat/stream (SSE streaming spotlight) ──────────
 
   app.post('/api/chat/stream', async (req, res) => {
@@ -260,6 +329,9 @@ async function main(): Promise<void> {
       const context = assembleContext(cached, queryClass.type, recentConversation)
       const isSpotlight = mode === 'spotlight'
 
+      // Screen context injection (only when query references "this" or current context)
+      const screenCtx = isSpotlight ? await getScreenContext(content) : ''
+
       const IRIS_RULES = `You are IRIS — a sharp, informed personal assistant embedded in a macOS Spotlight bar. You already know everything about this person. You are NOT a chatbot or search engine.
 
 RESPONSE RULES:
@@ -279,7 +351,7 @@ FORMATTING:
 
       const systemBlocks: any[] = isSpotlight ? [
         { type: 'text', text: IRIS_RULES, cache_control: { type: 'ephemeral' } },
-        { type: 'text', text: `\n\nCONTEXT:\n${context}`, cache_control: { type: 'ephemeral' } }
+        { type: 'text', text: `\n\nCONTEXT:\n${context}${screenCtx}`, cache_control: { type: 'ephemeral' } }
       ] : [
         { type: 'text', text: `You are Universal AI. Be concise and helpful.\n\n${context}` }
       ]
@@ -436,6 +508,9 @@ FORMATTING:
 
       const isSpotlight = mode === 'spotlight'
 
+      // Screen context injection (only when query references "this" or current context)
+      const screenCtx = isSpotlight ? await getScreenContext(content) : ''
+
       // ── Build system prompt with cache_control for stable blocks ──
       // Stable blocks (persona, rules, context) get cache_control for
       // Anthropic prompt caching. Volatile parts (query) stay uncached.
@@ -477,10 +552,10 @@ FORMATTING:
           text: IRIS_RULES,
           cache_control: { type: 'ephemeral' }
         },
-        // Block 2: Persona + stable context — changes on persona rewrite (~every 15min)
+        // Block 2: Persona + stable context + screen context
         {
           type: 'text',
-          text: `\n\nCONTEXT — this is who you're talking to and what you know:\n${context}`,
+          text: `\n\nCONTEXT — this is who you're talking to and what you know:\n${context}${screenCtx}`,
           cache_control: { type: 'ephemeral' }
         }
       ] : [
@@ -552,6 +627,92 @@ FORMATTING:
   })
 
   // ── GET /api/situation ──────────────────────────────────────
+
+  // ── GET /api/current-context (screen awareness for spotlight) ──
+
+  app.get('/api/current-context', async (_req, res) => {
+    try {
+      const pool = getPool()
+
+      // Get most recent screen_capture observation
+      const screenObs = await pool.query(
+        `SELECT raw_content, timestamp FROM observations
+         WHERE source = 'screen_capture' ORDER BY timestamp DESC LIMIT 1`
+      )
+
+      // Get most recent app_activity observation
+      const appObs = await pool.query(
+        `SELECT raw_content, timestamp FROM observations
+         WHERE source = 'app_activity' ORDER BY timestamp DESC LIMIT 1`
+      )
+
+      // Get most recent browser URL
+      const browserObs = await pool.query(
+        `SELECT raw_content, timestamp FROM observations
+         WHERE source IN ('browser_page', 'browser') ORDER BY timestamp DESC LIMIT 1`
+      )
+
+      const screen = screenObs.rows[0]
+      const appActivity = appObs.rows[0]
+      const browser = browserObs.rows[0]
+
+      // Parse app name and window title from app_activity
+      let focusedApp = ''
+      let windowTitle = ''
+      if (appActivity?.raw_content) {
+        const appMatch = appActivity.raw_content.match(/(?:Switched to|App):\s*(.+?)(?:\s*—\s*(.+))?$/)
+        if (appMatch) {
+          focusedApp = appMatch[1]?.trim() || ''
+          windowTitle = appMatch[2]?.trim() || ''
+        }
+      }
+
+      // Parse URL from browser observation
+      let url = ''
+      if (browser?.raw_content) {
+        const urlMatch = browser.raw_content.match(/https?:\/\/[^\s]+/)
+        if (urlMatch) url = urlMatch[0]
+      }
+
+      // OCR text from screen capture (last 500 chars)
+      let ocrText = ''
+      if (screen?.raw_content) {
+        // Screen capture format: "App: X\nWindow: Y\nURL: Z\nText:\n..."
+        const textSection = screen.raw_content.split('Text:\n')
+        ocrText = (textSection[1] || screen.raw_content).slice(0, 500)
+      }
+
+      // Detect entities in OCR
+      const detectedEntities: string[] = []
+      if (ocrText.length > 20) {
+        const contacts = await pool.query(
+          `SELECT name FROM relationships WHERE current_closeness > 15 ORDER BY current_closeness DESC LIMIT 20`
+        )
+        for (const c of contacts.rows) {
+          if (c.name && c.name.length > 3 && ocrText.toLowerCase().includes(c.name.toLowerCase())) {
+            detectedEntities.push(c.name)
+          }
+        }
+      }
+
+      // Freshness check
+      const screenAge = screen ? Date.now() - new Date(screen.timestamp).getTime() : 999999
+      const isFresh = screenAge < 60_000 // < 60 seconds
+
+      res.json({
+        fresh: isFresh,
+        focused_app: focusedApp,
+        window_title: windowTitle,
+        url,
+        ocr_text: isFresh ? ocrText : '',
+        detected_entities: detectedEntities,
+        timestamp: screen?.timestamp || null,
+        age_seconds: Math.round(screenAge / 1000)
+      })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
 
   app.get('/api/situation', async (_req, res) => {
     try {
@@ -2069,13 +2230,27 @@ FORMATTING:
 
   app.post('/api/google/connect', async (req, res) => {
     try {
-      const { refresh_token, email, google_client_id, google_client_secret, account_type } = req.body
+      const { refresh_token, email, google_client_id, google_client_secret, account_type, expected_email } = req.body
       if (!refresh_token || !email) return res.status(400).json({ error: 'refresh_token and email required' })
 
       const account = (account_type === 'school' ? 'school' : 'primary') as 'primary' | 'school'
       const provider = account === 'school' ? 'google_school' : 'google'
 
       const pool = getPool()
+
+      // Guard: prevent accidental overwrite of primary with wrong email
+      if (account === 'primary') {
+        const existing = await pool.query(`SELECT email FROM oauth_tokens WHERE provider = 'google'`)
+        if (existing.rows.length > 0 && existing.rows[0].email) {
+          const existingEmail = existing.rows[0].email
+          if (existingEmail !== email && expected_email && expected_email !== email) {
+            return res.status(400).json({
+              error: `Email mismatch — signed in as ${email} but primary is ${existingEmail}. Use Connect School Account for secondary accounts.`
+            })
+          }
+        }
+      }
+
       // Store client credentials in settings (shared across accounts)
       if (google_client_id) await pool.query(`INSERT INTO settings (key, value) VALUES ('google_client_id', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [google_client_id])
       if (google_client_secret) await pool.query(`INSERT INTO settings (key, value) VALUES ('google_client_secret', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [google_client_secret])
