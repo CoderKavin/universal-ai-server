@@ -1662,6 +1662,226 @@ FORMATTING:
     }
   })
 
+  // ── CONTEXTUAL OVERLAY ───────────────────────────────────────
+
+  app.post('/api/overlay/evaluate', async (req, res) => {
+    try {
+      const pool = getPool()
+      const { ocr_text, app: appName, window_title } = req.body
+      if (!ocr_text || ocr_text.length < 20) return res.json({ show: false })
+
+      const textLower = ocr_text.toLowerCase()
+      const insights: any[] = []
+
+      // ── Matcher 1: Contact name → actionable pending items ──
+      const contacts = await pool.query(
+        `SELECT name, email, current_closeness, trajectory, anomaly, last_interaction,
+                interaction_freq_30d, whatsapp_msgs_30d, email_count_30d
+         FROM relationships WHERE current_closeness > 15 ORDER BY current_closeness DESC LIMIT 20`
+      )
+      for (const c of contacts.rows) {
+        const nameLower = (c.name || '').toLowerCase()
+        if (nameLower.length < 3 || !textLower.includes(nameLower)) continue
+
+        // Gate 3: only if there's an actionable pending item
+        const pendingAction = await pool.query(
+          `SELECT id, title, trigger_context FROM predicted_actions
+           WHERE status = 'pending' AND expires_at > NOW()
+           AND (title ILIKE $1 OR related_entity ILIKE $2)
+           LIMIT 1`,
+          [`%${c.name}%`, `%${c.email}%`]
+        )
+        if (pendingAction.rows.length > 0) {
+          const pa = pendingAction.rows[0]
+          insights.push({
+            type: 'contact', label: 'CONTACT',
+            title: `${c.name}: pending action`,
+            body: (pa.trigger_context || pa.title || '').slice(0, 80),
+            confidence: 80,
+            entity_id: c.email
+          })
+          continue
+        }
+
+        // Gate 3: unaddressed recent message (last interaction within 2 days, stale thread)
+        const staleThread = await pool.query(
+          `SELECT thread_id, subject, stale_days FROM email_threads
+           WHERE participants LIKE $1 AND stale_days >= 3
+           ORDER BY stale_days DESC LIMIT 1`,
+          [`%${c.email}%`]
+        )
+        if (staleThread.rows.length > 0) {
+          insights.push({
+            type: 'contact', label: 'EMAIL',
+            title: `Stale thread with ${c.name}`,
+            body: `"${(staleThread.rows[0].subject || '').slice(0, 50)}" — ${staleThread.rows[0].stale_days}d no reply`,
+            confidence: 75,
+            entity_id: c.email
+          })
+        }
+      }
+
+      // ── Matcher 2: Calendar event approaching ──
+      if (appName?.toLowerCase().includes('calendar') || textLower.includes('calendar')) {
+        const upcoming = await pool.query(
+          `SELECT id, summary, start_time, participants FROM calendar_events
+           WHERE start_time::timestamptz > NOW() AND start_time::timestamptz < NOW() + INTERVAL '2 hours'
+           AND status != 'cancelled' AND all_day = 0
+           ORDER BY start_time::timestamptz LIMIT 3`
+        )
+        for (const ev of upcoming.rows) {
+          const evNameLower = (ev.summary || '').toLowerCase()
+          if (!textLower.includes(evNameLower) && evNameLower.length > 5) continue
+
+          // Gate 3: participant is a tracked contact with context
+          const participants = JSON.parse(ev.participants || '[]')
+          const contactMatch = contacts.rows.find((c: any) =>
+            participants.some((p: string) => p.toLowerCase().includes((c.name || '').toLowerCase()))
+          )
+          if (contactMatch) {
+            const minsLeft = Math.round((new Date(ev.start_time).getTime() - Date.now()) / 60000)
+            insights.push({
+              type: 'calendar', label: 'MEETING',
+              title: `${(ev.summary || '').slice(0, 40)} in ${minsLeft}m`,
+              body: `${contactMatch.name} — ${contactMatch.trajectory || 'stable'} relationship`,
+              confidence: 78,
+              entity_id: ev.id
+            })
+          }
+        }
+      }
+
+      // ── Matcher 3: Email compose (recipient in OCR) ──
+      const isCompose = textLower.includes('compose') || textLower.includes('new message') ||
+                        textLower.includes('reply') || (appName?.toLowerCase().includes('mail'))
+      if (isCompose) {
+        for (const c of contacts.rows) {
+          const nameLower = (c.name || '').toLowerCase()
+          if (nameLower.length < 3 || !textLower.includes(nameLower)) continue
+
+          // Gate 3: deadline/commitment involving this contact
+          const commitment = await pool.query(
+            `SELECT description, due_at FROM commitments
+             WHERE status = 'active' AND (committed_to ILIKE $1 OR committed_by ILIKE $1)
+             ORDER BY due_at ASC NULLS LAST LIMIT 1`,
+            [`%${c.email}%`]
+          )
+          if (commitment.rows.length > 0) {
+            const cm = commitment.rows[0]
+            const dueInfo = cm.due_at ? ` (due ${cm.due_at})` : ''
+            insights.push({
+              type: 'email', label: 'COMMITMENT',
+              title: `Open commitment with ${c.name}`,
+              body: `${(cm.description || '').slice(0, 60)}${dueInfo}`,
+              confidence: 82,
+              entity_id: c.email,
+              button: 'View',
+              action_type: 'view'
+            })
+            break
+          }
+
+          // Gate 3: relationship trajectory shift
+          if (c.anomaly === 'sudden_silence' || c.anomaly === 'overdue_followup') {
+            const daysSince = c.last_interaction
+              ? Math.round((Date.now() - new Date(c.last_interaction).getTime()) / 86400000)
+              : 0
+            if (daysSince >= 7) {
+              insights.push({
+                type: 'email', label: 'RELATIONSHIP',
+                title: `${c.name} — ${daysSince}d since last contact`,
+                body: c.anomaly === 'sudden_silence' ? 'Unusual silence detected' : 'Follow-up overdue',
+                confidence: 72,
+                entity_id: c.email
+              })
+              break
+            }
+          }
+        }
+      }
+
+      // ── Matcher 4: File/document (tracked doc name in OCR) ──
+      if (appName?.toLowerCase().includes('code') || appName?.toLowerCase().includes('docs') ||
+          appName?.toLowerCase().includes('word') || appName?.toLowerCase().includes('pages')) {
+        const recentDocs = await pool.query(
+          `SELECT id, filename, path, summary, last_modified FROM documents
+           WHERE last_modified > NOW() - INTERVAL '30 days'
+           ORDER BY last_modified DESC LIMIT 20`
+        )
+        for (const doc of recentDocs.rows) {
+          const fnLower = (doc.filename || '').toLowerCase()
+          if (fnLower.length < 4 || !textLower.includes(fnLower)) continue
+
+          // Gate 3: related commitment or deadline
+          const relCommitment = await pool.query(
+            `SELECT description FROM commitments WHERE status = 'active'
+             AND description ILIKE $1 LIMIT 1`,
+            [`%${doc.filename.slice(0, 20)}%`]
+          )
+          if (relCommitment.rows.length > 0) {
+            insights.push({
+              type: 'file', label: 'DOCUMENT',
+              title: doc.filename.slice(0, 40),
+              body: `Related: ${(relCommitment.rows[0].description || '').slice(0, 60)}`,
+              confidence: 73,
+              entity_id: doc.id
+            })
+          }
+        }
+      }
+
+      // ── Matcher 5: Centrum card ──
+      if (textLower.includes('centrum') || textLower.includes('spoika') || textLower.includes('today list')) {
+        // Check for chains related to visible content
+        const chains = await pool.query(
+          `SELECT ac.id, ac.trigger_event, COUNT(cs.id)::int as pending
+           FROM action_chains ac JOIN chain_steps cs ON cs.chain_id = ac.id AND cs.status = 'pending'
+           WHERE ac.status = 'active'
+           GROUP BY ac.id HAVING COUNT(cs.id) >= 2
+           LIMIT 3`
+        )
+        for (const ch of chains.rows) {
+          const triggerLower = (ch.trigger_event || '').toLowerCase()
+          // Only show if the chain topic is visible on screen
+          const words = triggerLower.split(/\s+/).filter((w: string) => w.length > 4)
+          const matchedWords = words.filter((w: string) => textLower.includes(w))
+          if (matchedWords.length >= 2) {
+            insights.push({
+              type: 'centrum', label: 'CHAIN PLAN',
+              title: (ch.trigger_event || '').slice(0, 45),
+              body: `${ch.pending} steps pending`,
+              confidence: 76,
+              entity_id: ch.id,
+              button: 'View Chain',
+              action_type: 'view_chain'
+            })
+          }
+        }
+      }
+
+      // Pick highest confidence insight
+      if (insights.length === 0) return res.json({ show: false })
+
+      insights.sort((a, b) => b.confidence - a.confidence)
+      const best = insights[0]
+
+      // Ensure total content < 140 chars
+      const totalLen = (best.label || '').length + (best.title || '').length + (best.body || '').length
+      if (totalLen > 140) {
+        best.body = (best.body || '').slice(0, 140 - (best.label || '').length - (best.title || '').length - 3) + '...'
+      }
+
+      res.json({
+        show: true,
+        id: `overlay-${Date.now()}`,
+        ...best
+      })
+    } catch (err: any) {
+      console.error('[overlay] Evaluate failed:', err.message)
+      res.json({ show: false })
+    }
+  })
+
   // ── GOOGLE SYNC (server-side) ─────────────────────────────────
 
   app.post('/api/google/connect', async (req, res) => {
