@@ -4,7 +4,7 @@
  */
 
 import { getPool } from './db'
-import { getValidAccessToken } from './google-auth'
+import { getValidAccessToken, type AccountType } from './google-auth'
 import crypto from 'crypto'
 
 const CALENDAR_API = 'https://www.googleapis.com/calendar/v3'
@@ -21,13 +21,15 @@ interface GCalEvent {
   status?: string
 }
 
-export async function runCalendarSync(): Promise<{ events: number }> {
+export async function runCalendarSync(account: AccountType = 'primary'): Promise<{ events: number }> {
   const pool = getPool()
-  const accessToken = await getValidAccessToken()
+  const accessToken = await getValidAccessToken(account)
+  const syncKey = account === 'school' ? 'calendar_school' : 'calendar'
+  const obsSource = account === 'school' ? 'calendar_school' : 'calendar'
 
-  await pool.query(`INSERT INTO sync_state (integration, last_sync_at, status, total_processed) VALUES ('calendar', NOW(), 'syncing', 0) ON CONFLICT (integration) DO UPDATE SET last_sync_at = NOW(), status = 'syncing'`)
+  await pool.query(`INSERT INTO sync_state (integration, last_sync_at, status, total_processed) VALUES ($1, NOW(), 'syncing', 0) ON CONFLICT (integration) DO UPDATE SET last_sync_at = NOW(), status = 'syncing'`, [syncKey])
 
-  console.log('[calendar-sync] Starting server-side calendar sync...')
+  console.log(`[calendar-sync] Starting ${account} calendar sync...`)
 
   // List calendars (fall back to primary only on 403)
   let calendars: { id: string; summary: string }[]
@@ -73,16 +75,16 @@ export async function runCalendarSync(): Promise<{ events: number }> {
       // Observation for each event
       const participantList = (event.attendees ?? []).map(a => a.displayName ?? a.email).filter(Boolean)
       await pool.query(
-        `INSERT INTO observations (id, source, event_type, raw_content) VALUES ($1, 'calendar', 'created', $2)`,
-        [crypto.randomUUID(), `${event.summary ?? '(No title)'} at ${startTime}${participantList.length > 0 ? ' with ' + participantList.slice(0, 3).join(', ') : ''}`]
+        `INSERT INTO observations (id, source, event_type, raw_content) VALUES ($1, $2, 'created', $3)`,
+        [crypto.randomUUID(), obsSource, `${event.summary ?? '(No title)'} at ${startTime}${participantList.length > 0 ? ' with ' + participantList.slice(0, 3).join(', ') : ''}`]
       )
 
       totalEvents++
     }
   }
 
-  await pool.query(`UPDATE sync_state SET status = 'complete', total_processed = $1 WHERE integration = 'calendar'`, [totalEvents])
-  console.log(`[calendar-sync] Complete: ${totalEvents} events`)
+  await pool.query(`UPDATE sync_state SET status = 'complete', total_processed = $1 WHERE integration = $2`, [totalEvents, syncKey])
+  console.log(`[calendar-sync] ${account} complete: ${totalEvents} events`)
 
   return { events: totalEvents }
 }
@@ -91,9 +93,10 @@ export async function createCalendarEvent(
   summary: string,
   startTime: string,
   endTime: string,
-  description?: string
+  description?: string,
+  account: AccountType = 'primary'
 ): Promise<string> {
-  const accessToken = await getValidAccessToken()
+  const accessToken = await getValidAccessToken(account)
 
   const res = await fetch(`${CALENDAR_API}/calendars/primary/events`, {
     method: 'POST',

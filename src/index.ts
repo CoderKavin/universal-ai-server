@@ -1886,11 +1886,14 @@ FORMATTING:
 
   app.post('/api/google/connect', async (req, res) => {
     try {
-      const { refresh_token, email, google_client_id, google_client_secret } = req.body
+      const { refresh_token, email, google_client_id, google_client_secret, account_type } = req.body
       if (!refresh_token || !email) return res.status(400).json({ error: 'refresh_token and email required' })
 
+      const account = (account_type === 'school' ? 'school' : 'primary') as 'primary' | 'school'
+      const provider = account === 'school' ? 'google_school' : 'google'
+
       const pool = getPool()
-      // Store client credentials in settings
+      // Store client credentials in settings (shared across accounts)
       if (google_client_id) await pool.query(`INSERT INTO settings (key, value) VALUES ('google_client_id', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [google_client_id])
       if (google_client_secret) await pool.query(`INSERT INTO settings (key, value) VALUES ('google_client_secret', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [google_client_secret])
 
@@ -1911,16 +1914,16 @@ FORMATTING:
 
       await pool.query(
         `INSERT INTO oauth_tokens (provider, access_token, refresh_token, expiry_date, email, updated_at)
-         VALUES ('google', $1, $2, $3, $4, NOW())
+         VALUES ($5, $1, $2, $3, $4, NOW())
          ON CONFLICT (provider) DO UPDATE SET access_token=$1, refresh_token=$2, expiry_date=$3, email=$4, updated_at=NOW()`,
-        [tokens.access_token, refresh_token, expiryDate, email]
+        [tokens.access_token, refresh_token, expiryDate, email, provider]
       )
 
       // Start sync scheduler if not already running
       const { startSyncScheduler } = await import('./sync-scheduler')
       startSyncScheduler()
 
-      res.json({ ok: true, email })
+      res.json({ ok: true, email, account_type: account })
     } catch (err: any) {
       res.status(500).json({ error: err.message })
     }
@@ -1941,15 +1944,25 @@ FORMATTING:
   app.get('/api/google/status', async (_req, res) => {
     try {
       const pool = getPool()
-      const tokenRes = await pool.query(`SELECT email FROM oauth_tokens WHERE provider = 'google'`)
-      const connected = tokenRes.rows.length > 0
-      const email = tokenRes.rows[0]?.email || null
+      const tokenRes = await pool.query(`SELECT provider, email FROM oauth_tokens WHERE provider IN ('google', 'google_school')`)
 
-      const syncRes = await pool.query(`SELECT integration, last_sync_at, status, total_processed FROM sync_state WHERE integration IN ('gmail', 'calendar', 'drive')`)
+      const accounts: any[] = []
+      let primaryConnected = false
+      let primaryEmail: string | null = null
+      for (const row of tokenRes.rows) {
+        const type = row.provider === 'google_school' ? 'school' : 'primary'
+        accounts.push({ type, email: row.email })
+        if (type === 'primary') { primaryConnected = true; primaryEmail = row.email }
+      }
+
+      const syncRes = await pool.query(
+        `SELECT integration, last_sync_at, status, total_processed FROM sync_state
+         WHERE integration IN ('gmail', 'calendar', 'drive', 'gmail_school', 'calendar_school', 'drive_school')`
+      )
       const syncs: Record<string, any> = {}
       for (const r of syncRes.rows) syncs[r.integration] = { last_sync: r.last_sync_at, status: r.status, total: r.total_processed }
 
-      res.json({ connected, email, ...syncs })
+      res.json({ connected: primaryConnected, email: primaryEmail, accounts, ...syncs })
     } catch (err: any) {
       res.status(500).json({ error: err.message })
     }

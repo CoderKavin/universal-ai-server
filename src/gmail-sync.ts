@@ -4,7 +4,7 @@
  */
 
 import { getPool } from './db'
-import { getValidAccessToken, getGoogleEmail } from './google-auth'
+import { getValidAccessToken, getGoogleEmail, type AccountType } from './google-auth'
 import Anthropic from '@anthropic-ai/sdk'
 import crypto from 'crypto'
 
@@ -45,49 +45,48 @@ interface ThreadAccum {
 
 // ── Main sync function ────────────────────────────────────────────
 
-export async function runGmailSync(): Promise<{ contacts: number; threads: number; commitments: number }> {
+export async function runGmailSync(account: AccountType = 'primary'): Promise<{ contacts: number; threads: number; commitments: number }> {
   const pool = getPool()
-  const accessToken = await getValidAccessToken()
-  const userEmail = (await getGoogleEmail()) || ''
+  const accessToken = await getValidAccessToken(account)
+  const userEmail = (await getGoogleEmail(account)) || ''
+  const syncKey = account === 'school' ? 'gmail_school' : 'gmail'
+  const sourceTag = account === 'school' ? 'email_school' : 'email'
 
   await pool.query(
     `INSERT INTO sync_state (integration, last_sync_at, status, total_processed)
-     VALUES ('gmail', NOW(), 'syncing', 0)
-     ON CONFLICT (integration) DO UPDATE SET last_sync_at = NOW(), status = 'syncing'`
+     VALUES ($1, NOW(), 'syncing', 0)
+     ON CONFLICT (integration) DO UPDATE SET last_sync_at = NOW(), status = 'syncing'`,
+    [syncKey]
   )
 
-  console.log('[gmail-sync] Starting server-side Gmail sync...')
+  console.log(`[gmail-sync] Starting ${account} Gmail sync (${userEmail})...`)
 
   // Fetch emails (90 days, max 500)
   let emails: GmailMessageMeta[]
   try {
     emails = await fetchEmails(accessToken, 90, 500)
   } catch (err: any) {
-    await pool.query(
-      `UPDATE sync_state SET status = 'error' WHERE integration = 'gmail'`
-    )
+    await pool.query(`UPDATE sync_state SET status = 'error' WHERE integration = $1`, [syncKey])
     throw err
   }
 
-  console.log(`[gmail-sync] Fetched ${emails.length} emails`)
+  console.log(`[gmail-sync] Fetched ${emails.length} emails from ${account}`)
 
   if (emails.length === 0) {
-    await pool.query(
-      `UPDATE sync_state SET status = 'complete', total_processed = 0 WHERE integration = 'gmail'`
-    )
+    await pool.query(`UPDATE sync_state SET status = 'complete', total_processed = 0 WHERE integration = $1`, [syncKey])
     return { contacts: 0, threads: 0, commitments: 0 }
   }
 
   // Process into contacts, threads, commitments
-  const result = await processEmails(pool, emails, userEmail)
+  const result = await processEmails(pool, emails, userEmail, sourceTag)
 
   await pool.query(
-    `UPDATE sync_state SET status = 'complete', total_processed = $1 WHERE integration = 'gmail'`,
-    [emails.length]
+    `UPDATE sync_state SET status = 'complete', total_processed = $1 WHERE integration = $2`,
+    [emails.length, syncKey]
   )
 
   console.log(
-    `[gmail-sync] Complete: ${result.contacts} contacts, ${result.threads} threads, ${result.commitments} commitments`
+    `[gmail-sync] ${account} complete: ${result.contacts} contacts, ${result.threads} threads, ${result.commitments} commitments`
   )
 
   return result
@@ -208,7 +207,8 @@ async function fetchMessageMeta(
 async function processEmails(
   pool: import('pg').Pool,
   emails: GmailMessageMeta[],
-  userEmail: string
+  userEmail: string,
+  sourceTag: string = 'email'
 ): Promise<{ contacts: number; threads: number; commitments: number }> {
   const userEmailLower = userEmail.toLowerCase()
 
@@ -231,9 +231,10 @@ async function processEmails(
     // Lightweight observation for each email
     try {
       await pool.query(
-        `INSERT INTO observations (id, source, event_type, raw_content) VALUES ($1, 'email', $2, $3)`,
+        `INSERT INTO observations (id, source, event_type, raw_content) VALUES ($1, $2, $3, $4)`,
         [
           crypto.randomUUID(),
+          sourceTag,
           isFromMe ? 'sent' : 'received',
           `${isFromMe ? 'To' : 'From'}: ${isFromMe ? email.to : email.from}\nSubject: ${email.subject}\n${email.snippet.slice(0, 200)}`
         ]
@@ -492,10 +493,11 @@ If NO real commitments exist, return []. Return ONLY valid JSON.`,
 export async function sendEmail(
   to: string,
   subject: string,
-  body: string
+  body: string,
+  account: AccountType = 'primary'
 ): Promise<string> {
-  const accessToken = await getValidAccessToken()
-  const userEmail = (await getGoogleEmail()) || 'me'
+  const accessToken = await getValidAccessToken(account)
+  const userEmail = (await getGoogleEmail(account)) || 'me'
 
   const message = [
     `From: ${userEmail}`,
@@ -529,8 +531,8 @@ export async function sendEmail(
 /**
  * Trash a sent email (for undo). Returns true on success.
  */
-export async function trashMessage(messageId: string): Promise<boolean> {
-  const accessToken = await getValidAccessToken()
+export async function trashMessage(messageId: string, account: AccountType = 'primary'): Promise<boolean> {
+  const accessToken = await getValidAccessToken(account)
   const res = await fetch(`${GMAIL_API}/messages/${messageId}/trash`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${accessToken}` }

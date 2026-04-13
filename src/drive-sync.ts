@@ -4,13 +4,14 @@
  */
 
 import { getPool } from './db'
-import { getValidAccessToken } from './google-auth'
+import { getValidAccessToken, type AccountType } from './google-auth'
 import crypto from 'crypto'
 
 const DRIVE_API = 'https://www.googleapis.com/drive/v3'
 
-// Track known files in memory (server is long-running)
+// Track known files in memory per account (server is long-running)
 const knownFiles = new Map<string, string>() // fileId → lastModified
+const knownFilesSchool = new Map<string, string>()
 
 interface DriveFile {
   id: string
@@ -24,13 +25,16 @@ interface DriveFile {
   parents?: string[]
 }
 
-export async function runDriveSync(): Promise<{ files: number }> {
+export async function runDriveSync(account: AccountType = 'primary'): Promise<{ files: number }> {
   const pool = getPool()
-  const accessToken = await getValidAccessToken()
+  const accessToken = await getValidAccessToken(account)
+  const syncKey = account === 'school' ? 'drive_school' : 'drive'
+  const obsSource = account === 'school' ? 'google_drive_school' : 'google_drive'
+  const fileMap = account === 'school' ? knownFilesSchool : knownFiles
 
-  await pool.query(`INSERT INTO sync_state (integration, last_sync_at, status, total_processed) VALUES ('drive', NOW(), 'syncing', 0) ON CONFLICT (integration) DO UPDATE SET last_sync_at = NOW(), status = 'syncing'`)
+  await pool.query(`INSERT INTO sync_state (integration, last_sync_at, status, total_processed) VALUES ($1, NOW(), 'syncing', 0) ON CONFLICT (integration) DO UPDATE SET last_sync_at = NOW(), status = 'syncing'`, [syncKey])
 
-  console.log('[drive-sync] Starting server-side Drive sync...')
+  console.log(`[drive-sync] Starting ${account} Drive sync...`)
 
   try {
     const cutoff = new Date(Date.now() - 90 * 86400000).toISOString()
@@ -49,7 +53,7 @@ export async function runDriveSync(): Promise<{ files: number }> {
       const errText = await res.text()
       if (res.status === 403) {
         console.log('[drive-sync] Drive API access denied (scope may be missing)')
-        await pool.query(`UPDATE sync_state SET status = 'no_scope' WHERE integration = 'drive'`)
+        await pool.query(`UPDATE sync_state SET status = 'no_scope' WHERE integration = $1`, [syncKey])
         return { files: 0 }
       }
       throw new Error(`Drive API ${res.status}: ${errText.slice(0, 200)}`)
@@ -60,11 +64,11 @@ export async function runDriveSync(): Promise<{ files: number }> {
     let newCount = 0
 
     for (const file of files) {
-      const prevModified = knownFiles.get(file.id)
+      const prevModified = fileMap.get(file.id)
       if (prevModified === file.modifiedTime) continue
 
       const isNew = !prevModified
-      knownFiles.set(file.id, file.modifiedTime)
+      fileMap.set(file.id, file.modifiedTime)
 
       // Get content preview for Google Docs/Sheets/Slides
       let preview = ''
@@ -100,14 +104,14 @@ export async function runDriveSync(): Promise<{ files: number }> {
       ].filter(Boolean).join('\n')
 
       await pool.query(
-        `INSERT INTO observations (id, source, event_type, raw_content) VALUES ($1, 'google_drive', $2, $3)`,
-        [crypto.randomUUID(), isNew ? 'created' : 'modified', content]
+        `INSERT INTO observations (id, source, event_type, raw_content) VALUES ($1, $4, $2, $3)`,
+        [crypto.randomUUID(), isNew ? 'created' : 'modified', content, obsSource]
       )
 
       newCount++
     }
 
-    await pool.query(`UPDATE sync_state SET status = 'complete', total_processed = $1 WHERE integration = 'drive'`, [files.length])
+    await pool.query(`UPDATE sync_state SET status = 'complete', total_processed = $1 WHERE integration = $2`, [files.length, syncKey])
 
     if (newCount > 0) {
       console.log(`[drive-sync] Synced ${newCount} new/modified files (${files.length} total)`)
@@ -118,7 +122,7 @@ export async function runDriveSync(): Promise<{ files: number }> {
     return { files: files.length }
   } catch (err: any) {
     console.error('[drive-sync] Sync error:', err.message)
-    await pool.query(`UPDATE sync_state SET status = 'error' WHERE integration = 'drive'`)
+    await pool.query(`UPDATE sync_state SET status = 'error' WHERE integration = $1`, [syncKey])
     return { files: 0 }
   }
 }
