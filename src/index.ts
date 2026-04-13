@@ -2578,11 +2578,11 @@ FORMATTING:
   const wss = new WebSocketServer({ noServer: true })
 
   server.on('upgrade', (request, socket, head) => {
-    if (request.url === '/ws/glasses') {
-      // Check auth for WebSocket
-      const url = new URL(request.url, `http://localhost`)
+    const url = new URL(request.url || '/', `http://localhost`)
+    if (url.pathname === '/ws/glasses') {
+      // Check auth for WebSocket — Bearer header or ?token= query param
       const token = request.headers.authorization?.replace('Bearer ', '') ||
-                    new URLSearchParams(url.search).get('token')
+                    url.searchParams.get('token')
       if (token !== ACCESS_TOKEN && ACCESS_TOKEN) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
         socket.destroy()
@@ -2598,44 +2598,445 @@ FORMATTING:
 
   let connectedDevices = 0
 
+  // ── Glasses helpers: Whisper transcription (Groq) ──────────────
+
+  function wrapPCMasWAV(pcm: Buffer, sampleRate: number, channels: number, bitsPerSample: number): Buffer {
+    const byteRate = sampleRate * channels * (bitsPerSample / 8)
+    const blockAlign = channels * (bitsPerSample / 8)
+    const header = Buffer.alloc(44)
+    header.write('RIFF', 0)
+    header.writeUInt32LE(36 + pcm.length, 4)
+    header.write('WAVE', 8)
+    header.write('fmt ', 12)
+    header.writeUInt32LE(16, 16)
+    header.writeUInt16LE(1, 20)
+    header.writeUInt16LE(channels, 22)
+    header.writeUInt32LE(sampleRate, 24)
+    header.writeUInt32LE(byteRate, 28)
+    header.writeUInt16LE(blockAlign, 32)
+    header.writeUInt16LE(bitsPerSample, 34)
+    header.write('data', 36)
+    header.writeUInt32LE(pcm.length, 40)
+    return Buffer.concat([header, pcm])
+  }
+
+  async function transcribeAudio(groqKey: string, pcmBuffer: Buffer): Promise<string> {
+    const Groq = (await import('groq-sdk')).default
+    const wavBuffer = wrapPCMasWAV(pcmBuffer, 16000, 1, 16)
+    const groq = new Groq({ apiKey: groqKey })
+    const file = new File([wavBuffer], 'audio.wav', { type: 'audio/wav' })
+    const transcription = await groq.audio.transcriptions.create({
+      file,
+      model: 'whisper-large-v3-turbo',
+      response_format: 'text'
+    })
+    return typeof transcription === 'string' ? transcription : (transcription as any).text ?? ''
+  }
+
+  // ── Glasses helpers: Cartesia TTS ──────────────────────────────
+
+  async function generateTTSRaw(cartesiaKey: string, text: string): Promise<Buffer | null> {
+    const response = await fetch('https://api.cartesia.ai/tts/bytes', {
+      method: 'POST',
+      headers: {
+        'X-API-Key': cartesiaKey,
+        'Cartesia-Version': '2024-06-10',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model_id: 'sonic-2',
+        transcript: text.slice(0, 5000),
+        voice: { mode: 'id', id: '87286a8d-7ea7-4235-a41a-dd9fa6630feb' },
+        output_format: { container: 'raw', sample_rate: 16000, encoding: 'pcm_s16le' }
+      })
+    })
+    if (!response.ok) {
+      console.error(`[TTS] Cartesia error: ${response.status} ${response.statusText}`)
+      return null
+    }
+    return Buffer.from(await response.arrayBuffer())
+  }
+
+  function sendTTSFrame(ws: WebSocket, pcmAudio: Buffer): void {
+    const frame = Buffer.alloc(1 + pcmAudio.length)
+    frame[0] = 0x10 // MSG_AUDIO_RESPONSE
+    pcmAudio.copy(frame, 1)
+    ws.send(frame)
+  }
+
+  // ── Glasses helpers: IRIS glasses system prompt ────────────────
+
+  const GLASSES_IRIS_RULES = `You are IRIS — a sharp, informed personal AI assistant. You are being spoken aloud through a TTS system on glasses. Responses must be concise, natural-sounding, and under 30 seconds of speech.
+
+You already know everything about this person. You are NOT a chatbot or search engine.
+
+VOICE RESPONSE RULES:
+- Lead with the answer. Never lead with context or preamble.
+- Maximum 2 sentences for factual answers (names, times, dates, yes/no).
+- Maximum 4 sentences for analytical answers (advice, comparisons, summaries).
+- No inline buttons, no formatting, no markdown, no 'click to expand'.
+- No 'uhh', 'let me think', 'well', or filler words.
+- No greetings, no sign-offs. Just the answer.
+- For long analytical answers, summarize to 1-2 sentences and end with: "Say 'more' for details."
+- Prefer specific over vague: "14 days" not "a while ago", "2:15pm" not "this afternoon".
+- If you don't have data, say what's missing in one sentence.
+
+CONFIDENCE RULES:
+- High (>80%): state as fact.
+- Medium (50-80%): hedge briefly. "Probably..." or "Likely..."
+- Low (<50%): explicit uncertainty or omit.
+
+OPINION RULES:
+- When asked for a recommendation, pick ONE answer with one-sentence defense. Commit, don't list.`
+
+  // ── Glasses helpers: voice query pipeline ──────────────────────
+
+  async function handleGlassesVoiceQuery(ws: WebSocket, pcmBuffer: Buffer): Promise<void> {
+    const t0 = Date.now()
+    const settings = await getSettings()
+    const groqKey = settings.groq_api_key || ''
+    const cartesiaKey = settings.cartesia_api_key || ''
+    const apiKey = settings.api_key || process.env.ANTHROPIC_API_KEY || ''
+
+    if (!groqKey) { ws.send(JSON.stringify({ error: 'No Groq API key configured' })); return }
+    if (!apiKey) { ws.send(JSON.stringify({ error: 'No Anthropic API key configured' })); return }
+    if (!cartesiaKey) { ws.send(JSON.stringify({ error: 'No Cartesia API key configured' })); return }
+
+    // Step 1: Transcribe via Groq Whisper
+    const transcript = await transcribeAudio(groqKey, pcmBuffer)
+    const t1 = Date.now()
+    console.log(`[glasses] transcribed in ${t1 - t0}ms: "${transcript.slice(0, 80)}"`)
+
+    if (!transcript || transcript.trim().length < 2) {
+      ws.send(JSON.stringify({ type: 'response', mode: 'voice', text: '' }))
+      return
+    }
+
+    // Log as observation
+    insertObservation('glasses_voice', 'queried', transcript, {}, 'neutral', [], '').catch(() => {})
+
+    // Step 2: Run through full IRIS chat pipeline (same brain as spotlight)
+    const Anthropic = (await import('@anthropic-ai/sdk')).default
+    const client = new Anthropic({ apiKey })
+
+    const recentQueries = await getRecentQueryMemory(5, 30)
+    const queryClass = classifyQuery(transcript)
+    const cached = await getCachedContext()
+
+    const recentConversation = recentQueries.length > 0
+      ? `RECENT CONVERSATION:\n${recentQueries.map((q: any) => {
+          const entities = Array.isArray(q.entities_mentioned) ? q.entities_mentioned :
+            (typeof q.entities_mentioned === 'string' ? JSON.parse(q.entities_mentioned) : [])
+          return `User: "${q.query_text}"\nIRIS: "${(q.response_text || '').slice(0, 100)}"${entities.length ? ` [${entities.join(', ')}]` : ''}`
+        }).join('\n')}`
+      : ''
+
+    const context = assembleContext(cached, queryClass.type, recentConversation)
+
+    const response = await client.messages.create({
+      model: settings.model || 'claude-sonnet-4-20250514',
+      max_tokens: 150,
+      system: [
+        { type: 'text', text: GLASSES_IRIS_RULES, cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: `\nCONTEXT:\n${context}`, cache_control: { type: 'ephemeral' } }
+      ],
+      messages: [{ role: 'user', content: transcript }]
+    })
+
+    const text = response.content?.[0]?.type === 'text' ? response.content[0].text ?? '' : ''
+    const t2 = Date.now()
+    console.log(`[glasses] Claude responded in ${t2 - t1}ms (${text.length} chars)`)
+
+    if (!text || text.trim().length === 0) {
+      ws.send(JSON.stringify({ type: 'response', mode: 'voice', text: '', error: 'Empty response from AI' }))
+      return
+    }
+
+    // Store in query memory
+    const entities = extractEntitiesFromText(text, transcript)
+    insertQueryMemory(transcript, text, entities).catch(() => {})
+
+    // Send text response (for logging/display on companion app)
+    ws.send(JSON.stringify({
+      type: 'response', mode: 'voice', text,
+      conversation_active: true,
+      listen_after: 5.0
+    }))
+
+    // Step 3: Generate TTS and stream back
+    const ttsAudio = await generateTTSRaw(cartesiaKey, text)
+    const t3 = Date.now()
+    console.log(`[glasses] TTS generated in ${t3 - t2}ms (${ttsAudio?.length ?? 0} bytes)`)
+
+    if (ttsAudio && ttsAudio.length > 0) {
+      const CHUNK_SIZE = 16000
+      for (let i = 0; i < ttsAudio.length; i += CHUNK_SIZE) {
+        const chunk = ttsAudio.subarray(i, Math.min(i + CHUNK_SIZE, ttsAudio.length))
+        sendTTSFrame(ws, chunk)
+      }
+    } else {
+      console.error('[glasses] TTS generation failed — no audio to send')
+    }
+
+    const totalMs = Date.now() - t0
+    console.log(`[glasses] voice query total: ${totalMs}ms (whisper: ${t1 - t0}ms, claude: ${t2 - t1}ms, tts: ${t3 - t2}ms)`)
+  }
+
+  // ── Glasses helpers: briefing generator ────────────────────────
+
+  async function handleGlassesBriefing(ws: WebSocket): Promise<void> {
+    const settings = await getSettings()
+    const apiKey = settings.api_key || process.env.ANTHROPIC_API_KEY || ''
+    const cartesiaKey = settings.cartesia_api_key || ''
+    if (!apiKey) { ws.send(JSON.stringify({ error: 'No API key' })); return }
+
+    const Anthropic = (await import('@anthropic-ai/sdk')).default
+    const client = new Anthropic({ apiKey })
+    const pool = getPool()
+
+    // Determine morning vs evening
+    const hour = new Date().getHours()
+    const isMorning = hour >= 5 && hour < 14
+
+    // Gather briefing context
+    const [profileRaw, cached, predictedActions, recentBreaks, lifeEvents] = await Promise.all([
+      getLivingProfile(),
+      getCachedContext(),
+      pool.query(
+        `SELECT title, description, urgency FROM predicted_actions WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY urgency DESC, predicted_at DESC LIMIT 5`
+      ).then(r => r.rows).catch(() => []),
+      pool.query(
+        `SELECT description, severity FROM routine_breaks WHERE detected_at > NOW() - INTERVAL '24 hours' ORDER BY detected_at DESC LIMIT 3`
+      ).then(r => r.rows).catch(() => []),
+      pool.query(
+        `SELECT summary FROM life_events WHERE detected_at > NOW() - INTERVAL '24 hours' ORDER BY detected_at DESC LIMIT 1`
+      ).then(r => r.rows).catch(() => [])
+    ])
+    const profile = profileRaw ?? ''
+
+    // Get upcoming events
+    const events = await pool.query(
+      `SELECT summary, start_time FROM calendar_events WHERE start_time > NOW() AND start_time < NOW() + INTERVAL '12 hours' ORDER BY start_time LIMIT 3`
+    )
+
+    // Get daily digest (for evening)
+    let digestSummary = ''
+    if (!isMorning) {
+      const digest = await pool.query(
+        `SELECT raw_content FROM observations WHERE source = 'daily_digest' ORDER BY timestamp DESC LIMIT 1`
+      )
+      digestSummary = digest.rows[0]?.raw_content?.slice(0, 500) || ''
+    }
+
+    const briefingContext = [
+      profile ? `PROFILE:\n${(typeof profile === 'string' ? profile : '').slice(0, 800)}` : '',
+      predictedActions.length ? `PRIORITIES:\n${predictedActions.map((a: any) => `- [${a.urgency}] ${a.title}: ${a.description}`).join('\n')}` : '',
+      events.rows.length ? `UPCOMING:\n${events.rows.map((e: any) => `- ${e.summary} at ${e.start_time}`).join('\n')}` : '',
+      recentBreaks.length ? `ROUTINE BREAKS:\n${recentBreaks.map((b: any) => `- ${b.description} (${b.severity})`).join('\n')}` : '',
+      lifeEvents.length ? `LIFE EVENT: ${lifeEvents[0].summary}` : '',
+      !isMorning && digestSummary ? `TODAY'S ACTIVITY:\n${digestSummary}` : ''
+    ].filter(Boolean).join('\n\n')
+
+    const briefingPrompt = isMorning
+      ? `Generate a 15-second morning briefing (about 40-50 words). Include:
+- Top 1-2 priorities for today
+- Any critical calendar events in the next few hours
+- Any notable routine breaks
+- Optional: a life event if one happened overnight
+Deliver as natural sentences, like a personal assistant briefing you. Conversational but efficient. No lists, no bullet points.`
+      : `Generate a 20-second evening briefing (about 55-65 words). Include:
+- What was accomplished today
+- What didn't get done that should have
+- One sentence on tomorrow's outlook
+- Optional: a pattern observation
+Deliver as natural sentences, like a personal assistant wrapping up the day. Reflective but forward-looking. No lists, no bullet points.`
+
+    const response = await client.messages.create({
+      model: settings.model || 'claude-sonnet-4-20250514',
+      max_tokens: 200,
+      system: `You are IRIS, a personal AI assistant delivering a spoken briefing through glasses TTS. Be concise, natural, and conversational. No filler words. No greetings.\n\n${briefingContext}`,
+      messages: [{ role: 'user', content: briefingPrompt }]
+    })
+
+    const text = response.content?.[0]?.type === 'text' ? response.content[0].text ?? '' : ''
+    console.log(`[glasses] briefing (${isMorning ? 'morning' : 'evening'}): ${text.slice(0, 100)}...`)
+
+    // Send text response
+    ws.send(JSON.stringify({ type: 'response', mode: 'briefing', text }))
+
+    // Generate and send TTS
+    if (cartesiaKey && text) {
+      const ttsAudio = await generateTTSRaw(cartesiaKey, text)
+      if (ttsAudio && ttsAudio.length > 0) {
+        const CHUNK_SIZE = 16000
+        for (let i = 0; i < ttsAudio.length; i += CHUNK_SIZE) {
+          sendTTSFrame(ws, ttsAudio.subarray(i, Math.min(i + CHUNK_SIZE, ttsAudio.length)))
+        }
+      }
+    }
+  }
+
+  // ── Glasses helpers: ambient audio processing ──────────────────
+
+  const ambientBuffers = new Map<WebSocket, { chunks: Buffer[], lastProcess: number, enabled: boolean, processing: boolean }>()
+
+  async function processAmbientAudio(ws: WebSocket, pcmChunk: Buffer): Promise<void> {
+    let state = ambientBuffers.get(ws)
+    if (!state) {
+      state = { chunks: [], lastProcess: Date.now(), enabled: true, processing: false }
+      ambientBuffers.set(ws, state)
+    }
+    if (!state.enabled || state.processing) return
+
+    state.chunks.push(pcmChunk)
+
+    // Process every 30 seconds
+    const elapsed = Date.now() - state.lastProcess
+    if (elapsed < 30000) return
+
+    const settings = await getSettings()
+    const groqKey = settings.groq_api_key || ''
+    if (!groqKey) return
+
+    // Combine chunks and transcribe — lock to prevent race
+    state.processing = true
+    const combined = Buffer.concat(state.chunks)
+    state.chunks = []
+    state.lastProcess = Date.now()
+
+    // Skip if too short (< 1 second of audio)
+    if (combined.length < 32000) return
+
+    try {
+      const transcript = await transcribeAudio(groqKey, combined)
+      if (!transcript || transcript.trim().length < 5) return
+
+      console.log(`[glasses-ambient] transcribed ${combined.length} bytes: "${transcript.slice(0, 100)}"`)
+
+      // Store as observation tagged with glasses_ambient source
+      await insertObservation(
+        'glasses_ambient',
+        'ambient_speech',
+        transcript,
+        {},
+        'neutral',
+        [],
+        ''
+      )
+
+      // Check for commitments or actionable items
+      const commitmentPatterns = /\b(remember|remind me|don't forget|need to|have to|should|must|gotta|gonna)\b/i
+      if (commitmentPatterns.test(transcript)) {
+        await insertObservation(
+          'glasses_ambient',
+          'commitment_detected',
+          transcript,
+          { source: 'spoken_aloud' },
+          'neutral',
+          [],
+          'Spoken commitment detected via glasses ambient listening'
+        )
+        console.log(`[glasses-ambient] commitment detected: "${transcript.slice(0, 80)}"`)
+      }
+    } catch (err: any) {
+      console.error(`[glasses-ambient] transcription error:`, err)
+    } finally {
+      state.processing = false
+    }
+  }
+
+  // ── WebSocket connection handler ───────────────────────────────
+
   wss.on('connection', (ws: WebSocket) => {
     connectedDevices++
     console.log(`[ws] Device connected (${connectedDevices} total)`)
-    ws.send(JSON.stringify({ type: 'ready', version: '0.1.0-cloud' }))
+    ws.send(JSON.stringify({ type: 'ready', version: '0.2.0-cloud-voice' }))
 
     ws.on('close', () => {
       connectedDevices--
+      ambientBuffers.delete(ws)
       console.log(`[ws] Device disconnected (${connectedDevices} total)`)
     })
 
     ws.on('message', async (data: Buffer) => {
-      // Same binary protocol as Electron version
       if (!Buffer.isBuffer(data) || data.length < 1) return
       const op = data[0]
       const payload = data.length > 1 ? data.subarray(1) : Buffer.alloc(0)
 
       try {
-        if (op === 0x04 && payload.length === 0) {
-          // Briefing request
-          const settings = await getSettings()
-          const apiKey = settings.api_key || process.env.ANTHROPIC_API_KEY || ''
-          if (!apiKey) { ws.send(JSON.stringify({ error: 'No API key' })); return }
+        switch (op) {
+          case 0x02: {
+            // Voice query — touch-initiated recording (PCM audio)
+            console.log(`[glasses] voice query: ${payload.length} bytes audio`)
+            await handleGlassesVoiceQuery(ws, payload)
+            break
+          }
 
-          const Anthropic = (await import('@anthropic-ai/sdk')).default
-          const client = new Anthropic({ apiKey })
-          const profile = await getLivingProfile() ?? ''
+          case 0x03: {
+            // Ambient listening — passive background audio chunk
+            await processAmbientAudio(ws, payload)
+            break
+          }
 
-          const response = await client.messages.create({
-            model: settings.model || 'claude-sonnet-4-20250514',
-            max_tokens: 300,
-            system: 'Concise daily briefing. Under 60 words. Conversational.',
-            messages: [{ role: 'user', content: profile.slice(0, 1500) }]
-          })
+          case 0x04: {
+            if (payload.length === 0) {
+              // Briefing request (empty payload)
+              console.log(`[glasses] briefing request`)
+              await handleGlassesBriefing(ws)
+            } else {
+              // Follow-up voice in conversation window (has audio payload)
+              console.log(`[glasses] follow-up voice: ${payload.length} bytes`)
+              await handleGlassesVoiceQuery(ws, payload)
+            }
+            break
+          }
 
-          const text = response.content[0].type === 'text' ? response.content[0].text : ''
-          ws.send(JSON.stringify({ type: 'response', mode: 'briefing', text }))
+          case 0x05: {
+            // Paired image + audio — extract audio, skip image for Phase 2
+            if (payload.length < 5) break
+            const imgLen5 = (payload[0] << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3]
+            if (imgLen5 > payload.length - 4) {
+              console.log(`[glasses] invalid image length: ${imgLen5} > ${payload.length - 4}`)
+              break
+            }
+            const audioStart5 = 4 + imgLen5
+            if (audioStart5 < payload.length) {
+              const audioPcm = payload.subarray(audioStart5)
+              console.log(`[glasses] paired msg — skipping ${imgLen5}B image, processing ${audioPcm.length}B audio`)
+              await handleGlassesVoiceQuery(ws, audioPcm)
+            }
+            break
+          }
+
+          case 0x08: {
+            // Passive image + audio — extract audio, skip image for Phase 2
+            if (payload.length < 5) break
+            const imgLen8 = (payload[0] << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3]
+            if (imgLen8 > payload.length - 4) {
+              console.log(`[glasses] invalid image length: ${imgLen8} > ${payload.length - 4}`)
+              break
+            }
+            const audioStart8 = 4 + imgLen8
+            if (audioStart8 < payload.length) {
+              const audioPcm = payload.subarray(audioStart8)
+              console.log(`[glasses] passive paired — skipping image, processing ${audioPcm.length}B audio`)
+              await processAmbientAudio(ws, audioPcm)
+            }
+            break
+          }
+
+          case 0x01:
+          case 0x09: {
+            // JPEG frame / scene snapshot — skip for Phase 2
+            console.log(`[glasses] image received (${payload.length}B) — skipped (Phase 2 voice-only)`)
+            break
+          }
+
+          default:
+            console.log(`[glasses] unknown op: 0x${op.toString(16)} (${payload.length} bytes)`)
         }
       } catch (err: any) {
+        console.error(`[glasses] error handling op 0x${op.toString(16)}: ${err.message}`)
         ws.send(JSON.stringify({ error: err.message }))
       }
     })
@@ -2648,7 +3049,7 @@ FORMATTING:
     const profile = await getLivingProfile()
     res.json({
       status: 'ok',
-      version: '0.1.0-cloud',
+      version: '0.2.0-cloud-voice',
       connected_devices: connectedDevices,
       observations: obsCount,
       persona_length: profile?.length ?? 0,

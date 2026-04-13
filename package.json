@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test:glasses-voice": "tsx test-glasses-voice.ts",
+    "test:glasses-voice:batch": "tsx test-glasses-voice.ts --batch",
+    "test:glasses-ws": "tsx test-glasses-ws.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.87.0",
