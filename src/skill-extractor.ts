@@ -481,13 +481,14 @@ export async function extractSkills(): Promise<number> {
 async function enrichWithClaude(apiKey: string, model: string, skills: SkillAssessment[]): Promise<void> {
   try {
     const Anthropic = (await import('@anthropic-ai/sdk')).default
+    const { claudeWithFallback } = await import('./claude-fallback')
     const client = new Anthropic({ apiKey })
 
     const skillDescriptions = skills.map((s, i) =>
       `[${i + 1}] ${s.name} (${s.category}): ${s.proficiency}/100, ${s.trajectory}\n  Evidence: ${s.examples.join('; ')}`
     ).join('\n\n')
 
-    const response = await client.messages.create({
+    const response = await claudeWithFallback(client, {
       model: model || 'claude-sonnet-4-20250514',
       max_tokens: 1500,
       system: `You are assessing a student's real skills based on behavioral evidence. For each skill, provide a one-sentence honest assessment that acknowledges both strengths and weaknesses visible in the data.
@@ -496,7 +497,7 @@ Return JSON array: [{"index": 1, "assessment": "honest one-sentence evaluation",
 
 Be brutally honest. If someone has 9 stale email threads averaging 10+ days, their communication follow-through is poor regardless of volume. If they're coding daily, that's a strong signal. Adjust scores up or down based on quality signals, not just quantity.`,
       messages: [{ role: 'user', content: skillDescriptions }]
-    })
+    }, 'skill-extractor')
 
     const raw = response.content[0].type === 'text' ? response.content[0].text : '[]'
     try {

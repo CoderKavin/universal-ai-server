@@ -123,9 +123,10 @@ export async function rewritePersonaWithConfidence(): Promise<string | null> {
 
   try {
     const Anthropic = (await import('@anthropic-ai/sdk')).default
+    const { claudeWithFallback } = await import('./claude-fallback')
     const client = new Anthropic({ apiKey })
 
-    const response = await client.messages.create({
+    const response = await claudeWithFallback(client, {
       model: settings.model || 'claude-sonnet-4-20250514',
       max_tokens: 4000,
       system: `You are writing the definitive understanding of a person. Today is ${today}.
@@ -173,7 +174,7 @@ Write as "I believe..." not "Kavin is...". Be specific with evidence. Every para
         role: 'user',
         content: `CURRENT PERSONA:\n${currentPersona}\n\n---\n\nACTIVE INSIGHTS WITH EVIDENCE SCORES (${allInsights.length}):\n\n${insightBlock}${lessonsSection ? `\n\n---\n\nEXISTING LESSONS LEARNED (preserve and extend):\n${lessonsSection}` : ''}`
       }]
-    })
+    }, 'persona-writer')
 
     const newPersona = response.content[0].type === 'text' ? response.content[0].text : ''
 

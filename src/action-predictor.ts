@@ -335,6 +335,7 @@ async function generateDrafts(apiKey: string, model: string, predictions: Predic
 
   try {
     const Anthropic = (await import('@anthropic-ai/sdk')).default
+    const { claudeWithFallback } = await import('./claude-fallback')
     const client = new Anthropic({ apiKey })
 
     for (const pred of toDraft) {
@@ -369,12 +370,12 @@ ${persona ? `About Kavin:\n${persona.slice(0, 500)}` : ''}`
 
         if (!prompt) continue
 
-        const response = await client.messages.create({
+        const response = await claudeWithFallback(client, {
           model: model || 'claude-sonnet-4-20250514',
           max_tokens: 300,
           system: systemMsg,
           messages: [{ role: 'user', content: prompt }]
-        })
+        }, 'action-predictor')
 
         const draft = response.content[0].type === 'text' ? response.content[0].text : ''
         if (draft.length > 10) {

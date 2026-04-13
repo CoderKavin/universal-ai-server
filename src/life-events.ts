@@ -380,9 +380,10 @@ async function triggerPersonaRewrite(eventType: string, eventSummary: string): P
 
   try {
     const Anthropic = (await import('@anthropic-ai/sdk')).default
+    const { claudeWithFallback } = await import('./claude-fallback')
     const client = new Anthropic({ apiKey })
 
-    const response = await client.messages.create({
+    const response = await claudeWithFallback(client, {
       model: settings.model || 'claude-sonnet-4-20250514',
       max_tokens: 3000,
       system: `You are rewriting the definitive understanding of a person because a MAJOR LIFE EVENT just occurred.
@@ -408,7 +409,7 @@ RULES: Write as "I believe..." not "Kavin is...". Be specific with evidence. Ref
         role: 'user',
         content: `CURRENT PERSONA:\n${currentPersona}\n\n---\n\nLIFE EVENT JUST DETECTED:\nType: ${eventType}\nSummary: ${eventSummary}\n\n---\n\nACTIVE INSIGHTS (${allInsights.length}):\n${insightBlock}`
       }]
-    })
+    }, 'life-event-persona')
 
     const newPersona = response.content[0].type === 'text' ? response.content[0].text : ''
 

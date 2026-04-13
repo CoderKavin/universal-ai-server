@@ -216,9 +216,10 @@ async function reasonChain(
 ): Promise<ChainStep[] | null> {
   try {
     const Anthropic = (await import('@anthropic-ai/sdk')).default
+    const { claudeWithFallback } = await import('./claude-fallback')
     const client = new Anthropic({ apiKey })
 
-    const response = await client.messages.create({
+    const response = await claudeWithFallback(client, {
       model: model || 'claude-sonnet-4-20250514',
       max_tokens: 2000,
       system: `You are IRIS's chain reasoning engine. Given a triggering event and full context about Kavin, think THREE steps ahead in a causal chain.
@@ -250,7 +251,7 @@ If you cannot generate a meaningful 3-step chain (the trigger is too simple or l
         role: 'user',
         content: `TRIGGERING EVENT: ${trigger}\nTRIGGER TYPE: ${triggerType}\n\nCONTEXT:\n${contextParts.join('\n\n')}`
       }]
-    })
+    }, 'chain-reasoner')
 
     const raw = response.content[0].type === 'text' ? response.content[0].text : '[]'
 

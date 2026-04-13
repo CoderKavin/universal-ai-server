@@ -6,6 +6,7 @@
 import { getPool } from './db'
 import { getValidAccessToken, getGoogleEmail, type AccountType } from './google-auth'
 import Anthropic from '@anthropic-ai/sdk'
+import { claudeWithFallback } from './claude-fallback'
 import crypto from 'crypto'
 
 const GMAIL_API = 'https://gmail.googleapis.com/gmail/v1/users/me'
@@ -431,7 +432,7 @@ async function processEmails(
 
       try {
         const client = new Anthropic({ apiKey })
-        const response = await client.messages.create({
+        const response = await claudeWithFallback(client, {
           model,
           max_tokens: 600,
           system: `Extract real commitments and deadlines from these emails. ONLY return genuine commitments — things someone promised to do, deadlines, or action items. Ignore marketing, newsletters, verification codes, receipts, and generic CTAs like "click here" or "take our survey".
@@ -441,7 +442,7 @@ Return JSON array:
 
 If NO real commitments exist, return []. Return ONLY valid JSON.`,
           messages: [{ role: 'user', content: batchText }]
-        })
+        }, 'gmail-commitments')
 
         const raw = response.content?.[0]?.type === 'text' ? response.content[0].text : '[]'
         try {

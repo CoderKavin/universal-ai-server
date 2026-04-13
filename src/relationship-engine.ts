@@ -344,9 +344,10 @@ async function generateNarratives(
 
   try {
     const Anthropic = (await import('@anthropic-ai/sdk')).default
+    const { claudeWithFallback } = await import('./claude-fallback')
     const client = new Anthropic({ apiKey })
 
-    const response = await client.messages.create({
+    const response = await claudeWithFallback(client, {
       model: model || 'claude-sonnet-4-20250514',
       max_tokens: 2000,
       system: `You are writing one-sentence narrative notes about Kavin's relationships. For each contact, write a single vivid, specific sentence that captures where the relationship is RIGHT NOW — not a summary, but a snapshot.
@@ -361,7 +362,7 @@ Return ONLY a JSON array: [{"index": 1, "note": "..."}, ...]`,
         role: 'user',
         content: contactDescriptions
       }]
-    })
+    }, 'relationship-engine')
 
     const raw = response.content[0].type === 'text' ? response.content[0].text : '[]'
     try {

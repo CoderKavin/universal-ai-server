@@ -77,9 +77,10 @@ export async function runSecondPass(input: SecondPassInput): Promise<string | nu
 
   try {
     const Anthropic = (await import('@anthropic-ai/sdk')).default
+    const { claudeWithFallback } = await import('./claude-fallback')
     const client = new Anthropic({ apiKey })
 
-    const response = await client.messages.create({
+    const response = await claudeWithFallback(client, {
       model: settings.model || 'claude-sonnet-4-20250514',
       max_tokens: 150,
       system: `You are IRIS's second-pass filter. The user asked a question and got a literal answer. You must decide whether to append ONE brief piece of urgent context.
@@ -107,7 +108,7 @@ Urgency: ${topUrgent.urgencyScore}/10
 
 Should this be appended? If yes, compose the brief addition. If no, return NONE.`
       }]
-    })
+    }, 'second-pass')
 
     const addition = response.content[0].type === 'text' ? response.content[0].text.trim() : 'NONE'
 

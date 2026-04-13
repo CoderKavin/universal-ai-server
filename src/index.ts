@@ -28,6 +28,7 @@ import { extractRoutines, detectRoutineBreaks, getActiveRoutines, getRecentBreak
 import { extractSkills, getSkills, formatSkillsForContext } from './skill-extractor'
 import { runSecondPass } from './second-pass'
 import { runActionPredictor, getPendingActions, formatPredictedActionsForContext, regenerateOnEvent, markActionServed } from './action-predictor'
+import { claudeWithFallback, claudeStreamWithFallback, getDegradationWhisper } from './claude-fallback'
 import { generateChain, generateChainsForUrgentItems, completeChainStep, getActiveChains, formatChainsForContext } from './chain-reasoner'
 import { getCachedContext, invalidateCache, getCacheStats, assembleContext, classifyQuery, rebuildCache } from './context-cache'
 import {
@@ -374,12 +375,12 @@ FORMATTING:
         // Use non-streaming Claude call, but write result immediately
         // Streaming through Render's proxy has buffering issues. Instead,
         // we call Claude normally and stream the RESULT to the client token by token
-        const result = await client.messages.create({
+        const result = await claudeWithFallback(client, {
           model: settings.model || 'claude-sonnet-4-20250514',
           max_tokens: isSpotlight ? 300 : 500,
           system: systemStr,
           messages: [{ role: 'user', content }]
-        })
+        }, 'spotlight-stream')
 
         fullText = result.content[0].type === 'text' ? result.content[0].text : ''
 
@@ -564,12 +565,12 @@ FORMATTING:
 
       // ── Fire main response (+ parallel second-pass for analytical) ──
 
-      const mainCallPromise = client.messages.create({
+      const mainCallPromise = claudeWithFallback(client, {
         model: settings.model || 'claude-sonnet-4-20250514',
         max_tokens: isSpotlight ? 300 : 500,
         system: systemBlocks,
         messages: [{ role: 'user', content }]
-      })
+      }, 'spotlight-chat')
 
       // For analytical queries, fire second-pass in parallel
       let secondPassPromise: Promise<string | null> | null = null
@@ -763,12 +764,12 @@ FORMATTING:
         `Commitments: ${commitments.slice(0, 3).map((c: any) => c.description.slice(0, 60)).join('; ') || 'none'}`
       ].join('\n')
 
-      const response = await client.messages.create({
+      const response = await claudeWithFallback(client, {
         model: settings.model || 'claude-sonnet-4-20250514',
         max_tokens: 400,
         system: 'You are Universal AI giving a concise daily briefing. Under 75 words. Conversational, not robotic.',
         messages: [{ role: 'user', content: context }]
-      })
+      }, 'briefing')
 
       const text = response.content[0].type === 'text' ? response.content[0].text : ''
       res.json({ text })
@@ -2633,21 +2634,27 @@ FORMATTING:
     return typeof transcription === 'string' ? transcription : (transcription as any).text ?? ''
   }
 
-  // ── Glasses helpers: Cartesia TTS ──────────────────────────────
+  // ── Glasses helpers: Cartesia TTS (REST fallback + WebSocket streaming) ──
 
+  const CARTESIA_VOICE_ID = '4f7f1324-1853-48a6-b294-4e78e8036a83'
+  const CARTESIA_MODEL = 'sonic-2'
+  const CARTESIA_VERSION = '2024-06-10'
+  const CARTESIA_OUTPUT_FORMAT = { container: 'raw' as const, sample_rate: 16000, encoding: 'pcm_s16le' as const }
+
+  // REST fallback for briefing or when WS is unavailable
   async function generateTTSRaw(cartesiaKey: string, text: string): Promise<Buffer | null> {
     const response = await fetch('https://api.cartesia.ai/tts/bytes', {
       method: 'POST',
       headers: {
         'X-API-Key': cartesiaKey,
-        'Cartesia-Version': '2024-06-10',
+        'Cartesia-Version': CARTESIA_VERSION,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model_id: 'sonic-2',
+        model_id: CARTESIA_MODEL,
         transcript: text.slice(0, 5000),
-        voice: { mode: 'id', id: '4f7f1324-1853-48a6-b294-4e78e8036a83' },
-        output_format: { container: 'raw', sample_rate: 16000, encoding: 'pcm_s16le' }
+        voice: { mode: 'id', id: CARTESIA_VOICE_ID },
+        output_format: CARTESIA_OUTPUT_FORMAT
       })
     })
     if (!response.ok) {
@@ -2662,6 +2669,161 @@ FORMATTING:
     frame[0] = 0x10 // MSG_AUDIO_RESPONSE
     pcmAudio.copy(frame, 1)
     ws.send(frame)
+  }
+
+  // ── Cartesia WebSocket streaming TTS ──────────────────────────
+
+  // Persistent WS connection to Cartesia for streaming TTS
+  let cartesiaWs: import('ws').WebSocket | null = null
+  let cartesiaWsReady = false
+  let cartesiaWsKey = ''
+  const cartesiaListeners = new Map<string, (msg: any) => void>()
+
+  function getCartesiaWs(cartesiaKey: string): Promise<import('ws').WebSocket> {
+    return new Promise((resolve, reject) => {
+      // Reuse if connected and key matches
+      if (cartesiaWs && cartesiaWsReady && cartesiaWsKey === cartesiaKey) {
+        resolve(cartesiaWs)
+        return
+      }
+
+      // Close stale connection
+      if (cartesiaWs) {
+        try { cartesiaWs.close() } catch {}
+        cartesiaWs = null
+        cartesiaWsReady = false
+      }
+
+      const WS = require('ws') as typeof import('ws')
+      const wsUrl = `wss://api.cartesia.ai/tts/websocket?api_key=${encodeURIComponent(cartesiaKey)}&cartesia_version=${CARTESIA_VERSION}`
+      const ws = new WS.WebSocket(wsUrl)
+      cartesiaWsKey = cartesiaKey
+
+      const timeout = setTimeout(() => {
+        ws.close()
+        reject(new Error('Cartesia WS connection timeout'))
+      }, 10000)
+
+      ws.on('open', () => {
+        clearTimeout(timeout)
+        cartesiaWs = ws
+        cartesiaWsReady = true
+        console.log('[TTS-WS] Cartesia WebSocket connected')
+        resolve(ws)
+      })
+
+      ws.on('message', (raw: Buffer) => {
+        try {
+          const msg = JSON.parse(raw.toString())
+          const contextId = msg.context_id
+          if (contextId && cartesiaListeners.has(contextId)) {
+            cartesiaListeners.get(contextId)!(msg)
+          }
+        } catch (err) {
+          console.error('[TTS-WS] Failed to parse Cartesia message:', err)
+        }
+      })
+
+      ws.on('close', () => {
+        console.log('[TTS-WS] Cartesia WebSocket closed')
+        cartesiaWs = null
+        cartesiaWsReady = false
+      })
+
+      ws.on('error', (err: Error) => {
+        clearTimeout(timeout)
+        console.error('[TTS-WS] Cartesia WebSocket error:', err.message)
+        cartesiaWs = null
+        cartesiaWsReady = false
+        reject(err)
+      })
+    })
+  }
+
+  /**
+   * Stream text chunks to Cartesia WS and forward audio to glasses in real-time.
+   * Returns a controller object with sendChunk() and finish() methods.
+   */
+  function createCartesiaStream(cartesiaKey: string, glassesWs: WebSocket): {
+    sendChunk: (text: string) => void
+    finish: () => Promise<{ audioBytes: number; chunks: number }>
+    contextId: string
+    ready: Promise<void>
+  } {
+    const contextId = `glasses-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    let audioBytes = 0
+    let audioChunks = 0
+    let resolveReady: () => void
+    let rejectReady: (err: Error) => void
+    let resolveDone: (val: { audioBytes: number; chunks: number }) => void
+    let wsInstance: import('ws').WebSocket | null = null
+    let firstChunkSent = false
+
+    const readyPromise = new Promise<void>((res, rej) => { resolveReady = res; rejectReady = rej })
+    const donePromise = new Promise<{ audioBytes: number; chunks: number }>((res) => { resolveDone = res })
+
+    // Set up listener for this context
+    cartesiaListeners.set(contextId, (msg: any) => {
+      if (msg.type === 'chunk' && msg.data) {
+        const pcm = Buffer.from(msg.data, 'base64')
+        audioBytes += pcm.length
+        audioChunks++
+        // Forward to glasses immediately
+        sendTTSFrame(glassesWs, pcm)
+      } else if (msg.type === 'done') {
+        cartesiaListeners.delete(contextId)
+        resolveDone({ audioBytes, chunks: audioChunks })
+      } else if (msg.type === 'error') {
+        console.error(`[TTS-WS] Cartesia stream error (${contextId}):`, msg.error)
+        cartesiaListeners.delete(contextId)
+        resolveDone({ audioBytes, chunks: audioChunks })
+      }
+    })
+
+    // Connect asynchronously
+    getCartesiaWs(cartesiaKey).then(ws => {
+      wsInstance = ws
+      resolveReady!()
+    }).catch(err => {
+      console.error('[TTS-WS] Failed to connect for streaming:', err.message)
+      cartesiaListeners.delete(contextId)
+      rejectReady!(err)
+    })
+
+    return {
+      contextId,
+      ready: readyPromise,
+      sendChunk(text: string) {
+        if (!wsInstance || !text.trim()) return
+        wsInstance.send(JSON.stringify({
+          model_id: CARTESIA_MODEL,
+          transcript: text,
+          voice: { mode: 'id', id: CARTESIA_VOICE_ID },
+          output_format: CARTESIA_OUTPUT_FORMAT,
+          context_id: contextId,
+          continue: true,
+          language: 'en'
+        }))
+        if (!firstChunkSent) {
+          firstChunkSent = true
+          console.log(`[TTS-WS] First text chunk sent to Cartesia (${contextId})`)
+        }
+      },
+      async finish(): Promise<{ audioBytes: number; chunks: number }> {
+        if (!wsInstance) return { audioBytes: 0, chunks: 0 }
+        // Send empty transcript with continue=false to signal end
+        wsInstance.send(JSON.stringify({
+          model_id: CARTESIA_MODEL,
+          transcript: '',
+          voice: { mode: 'id', id: CARTESIA_VOICE_ID },
+          output_format: CARTESIA_OUTPUT_FORMAT,
+          context_id: contextId,
+          continue: false,
+          language: 'en'
+        }))
+        return donePromise
+      }
+    }
   }
 
   // ── Glasses helpers: IRIS glasses system prompt ────────────────
@@ -2715,7 +2877,7 @@ OPINION RULES:
     // Log as observation
     insertObservation('glasses_voice', 'queried', transcript, {}, 'neutral', [], '').catch(() => {})
 
-    // Step 2: Run through full IRIS chat pipeline (same brain as spotlight)
+    // Step 2+3: Stream Claude → Cartesia WS → glasses speaker (pipelined)
     const Anthropic = (await import('@anthropic-ai/sdk')).default
     const client = new Anthropic({ apiKey })
 
@@ -2733,53 +2895,104 @@ OPINION RULES:
 
     const context = assembleContext(cached, queryClass.type, recentConversation)
 
-    const response = await client.messages.create({
-      model: settings.model || 'claude-sonnet-4-20250514',
-      max_tokens: 150,
-      system: [
-        { type: 'text', text: GLASSES_IRIS_RULES, cache_control: { type: 'ephemeral' } },
-        { type: 'text', text: `\nCONTEXT:\n${context}`, cache_control: { type: 'ephemeral' } }
-      ],
-      messages: [{ role: 'user', content: transcript }]
-    })
+    // Start Cartesia WS stream in parallel with Claude call
+    const ttsStream = createCartesiaStream(cartesiaKey, ws)
 
-    const text = response.content?.[0]?.type === 'text' ? response.content[0].text ?? '' : ''
+    // Use Claude streaming so we can pipe tokens to Cartesia as they arrive
+    let fullText = ''
+    let textBuffer = '' // Buffer text until we hit a sentence boundary
+    let tFirstAudio = 0
+    const tClaudeStart = Date.now()
+
+    try {
+      // Wait for Cartesia WS to be ready before starting Claude stream
+      await ttsStream.ready
+
+      const stream = client.messages.stream({
+        model: settings.model || 'claude-sonnet-4-20250514',
+        max_tokens: 150,
+        system: [
+          { type: 'text', text: GLASSES_IRIS_RULES, cache_control: { type: 'ephemeral' } as any },
+          { type: 'text', text: `\nCONTEXT:\n${context}`, cache_control: { type: 'ephemeral' } as any }
+        ],
+        messages: [{ role: 'user', content: transcript }]
+      })
+
+      // Sentence-boundary regex: split on . ! ? followed by space or end
+      const sentenceBoundary = /[.!?](?:\s|$)/
+
+      for await (const event of stream) {
+        if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+          const token = event.delta.text
+          fullText += token
+          textBuffer += token
+
+          // Send to Cartesia when we accumulate a sentence boundary or 80+ chars
+          if (sentenceBoundary.test(textBuffer) || textBuffer.length >= 80) {
+            ttsStream.sendChunk(textBuffer)
+            if (!tFirstAudio) tFirstAudio = Date.now()
+            textBuffer = ''
+          }
+        }
+      }
+
+      // Flush any remaining text
+      if (textBuffer.trim()) {
+        ttsStream.sendChunk(textBuffer)
+        if (!tFirstAudio) tFirstAudio = Date.now()
+      }
+    } catch (err: any) {
+      // On Claude streaming error, try fallback with non-streaming
+      console.error(`[glasses] Claude stream error: ${err.message} — trying fallback`)
+      try {
+        const fallbackResponse = await claudeWithFallback(client, {
+          model: settings.model || 'claude-sonnet-4-20250514',
+          max_tokens: 150,
+          system: [
+            { type: 'text', text: GLASSES_IRIS_RULES, cache_control: { type: 'ephemeral' } },
+            { type: 'text', text: `\nCONTEXT:\n${context}`, cache_control: { type: 'ephemeral' } }
+          ],
+          messages: [{ role: 'user', content: transcript }]
+        }, 'glasses-voice-fallback')
+        fullText = fallbackResponse.content?.[0]?.type === 'text' ? fallbackResponse.content[0].text ?? '' : ''
+        if (fullText) {
+          ttsStream.sendChunk(fullText)
+          if (!tFirstAudio) tFirstAudio = Date.now()
+        }
+      } catch (fallbackErr: any) {
+        console.error(`[glasses] All Claude models failed: ${fallbackErr.message}`)
+        ws.send(JSON.stringify({ type: 'response', mode: 'voice', text: '', error: 'AI temporarily unavailable' }))
+        return
+      }
+    }
+
     const t2 = Date.now()
-    console.log(`[glasses] Claude responded in ${t2 - t1}ms (${text.length} chars)`)
+    console.log(`[glasses] Claude streamed in ${t2 - tClaudeStart}ms (${fullText.length} chars)`)
 
-    if (!text || text.trim().length === 0) {
+    if (!fullText || fullText.trim().length === 0) {
       ws.send(JSON.stringify({ type: 'response', mode: 'voice', text: '', error: 'Empty response from AI' }))
       return
     }
 
     // Store in query memory
-    const entities = extractEntitiesFromText(text, transcript)
-    insertQueryMemory(transcript, text, entities).catch(() => {})
+    const entities = extractEntitiesFromText(fullText, transcript)
+    insertQueryMemory(transcript, fullText, entities).catch(() => {})
 
     // Send text response (for logging/display on companion app)
+    const degradationNote = getDegradationWhisper()
     ws.send(JSON.stringify({
-      type: 'response', mode: 'voice', text,
+      type: 'response', mode: 'voice', text: fullText,
       conversation_active: true,
-      listen_after: 5.0
+      listen_after: 5.0,
+      ...(degradationNote ? { whisper: degradationNote } : {})
     }))
 
-    // Step 3: Generate TTS and stream back
-    const ttsAudio = await generateTTSRaw(cartesiaKey, text)
+    // Wait for Cartesia to finish sending all audio
+    const ttsResult = await ttsStream.finish()
     const t3 = Date.now()
-    console.log(`[glasses] TTS generated in ${t3 - t2}ms (${ttsAudio?.length ?? 0} bytes)`)
 
-    if (ttsAudio && ttsAudio.length > 0) {
-      const CHUNK_SIZE = 16000
-      for (let i = 0; i < ttsAudio.length; i += CHUNK_SIZE) {
-        const chunk = ttsAudio.subarray(i, Math.min(i + CHUNK_SIZE, ttsAudio.length))
-        sendTTSFrame(ws, chunk)
-      }
-    } else {
-      console.error('[glasses] TTS generation failed — no audio to send')
-    }
-
-    const totalMs = Date.now() - t0
-    console.log(`[glasses] voice query total: ${totalMs}ms (whisper: ${t1 - t0}ms, claude: ${t2 - t1}ms, tts: ${t3 - t2}ms)`)
+    const ttfb = tFirstAudio ? tFirstAudio - t0 : t3 - t0
+    console.log(`[glasses] voice query total: ${t3 - t0}ms (whisper: ${t1 - t0}ms, claude-stream: ${t2 - tClaudeStart}ms, tts-stream: ${t3 - t2}ms, TTFB: ${ttfb}ms, audio: ${ttsResult.audioBytes} bytes / ${ttsResult.chunks} chunks)`)
   }
 
   // ── Glasses helpers: briefing generator ────────────────────────
@@ -2851,28 +3064,62 @@ Deliver as natural sentences, like a personal assistant briefing you. Conversati
 - Optional: a pattern observation
 Deliver as natural sentences, like a personal assistant wrapping up the day. Reflective but forward-looking. No lists, no bullet points.`
 
-    const response = await client.messages.create({
-      model: settings.model || 'claude-sonnet-4-20250514',
-      max_tokens: 200,
-      system: `You are IRIS, a personal AI assistant delivering a spoken briefing through glasses TTS. Be concise, natural, and conversational. No filler words. No greetings.\n\n${briefingContext}`,
-      messages: [{ role: 'user', content: briefingPrompt }]
-    })
+    // Stream Claude → Cartesia WS → glasses for low-latency briefing
+    const ttsStream = cartesiaKey ? createCartesiaStream(cartesiaKey, ws) : null
+    let fullText = ''
 
-    const text = response.content?.[0]?.type === 'text' ? response.content[0].text ?? '' : ''
-    console.log(`[glasses] briefing (${isMorning ? 'morning' : 'evening'}): ${text.slice(0, 100)}...`)
+    try {
+      if (ttsStream) await ttsStream.ready
 
-    // Send text response
-    ws.send(JSON.stringify({ type: 'response', mode: 'briefing', text }))
+      const stream = client.messages.stream({
+        model: settings.model || 'claude-sonnet-4-20250514',
+        max_tokens: 200,
+        system: `You are IRIS, a personal AI assistant delivering a spoken briefing through glasses TTS. Be concise, natural, and conversational. No filler words. No greetings.\n\n${briefingContext}`,
+        messages: [{ role: 'user', content: briefingPrompt }]
+      })
 
-    // Generate and send TTS
-    if (cartesiaKey && text) {
-      const ttsAudio = await generateTTSRaw(cartesiaKey, text)
-      if (ttsAudio && ttsAudio.length > 0) {
-        const CHUNK_SIZE = 16000
-        for (let i = 0; i < ttsAudio.length; i += CHUNK_SIZE) {
-          sendTTSFrame(ws, ttsAudio.subarray(i, Math.min(i + CHUNK_SIZE, ttsAudio.length)))
+      let textBuffer = ''
+      const sentenceBoundary = /[.!?](?:\s|$)/
+
+      for await (const event of stream) {
+        if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+          fullText += event.delta.text
+          textBuffer += event.delta.text
+
+          if (ttsStream && (sentenceBoundary.test(textBuffer) || textBuffer.length >= 80)) {
+            ttsStream.sendChunk(textBuffer)
+            textBuffer = ''
+          }
         }
       }
+
+      if (ttsStream && textBuffer.trim()) {
+        ttsStream.sendChunk(textBuffer)
+      }
+    } catch (err: any) {
+      console.error(`[glasses] Briefing stream error: ${err.message} — trying fallback`)
+      try {
+        const fallbackResponse = await claudeWithFallback(client, {
+          model: settings.model || 'claude-sonnet-4-20250514',
+          max_tokens: 200,
+          system: `You are IRIS, a personal AI assistant delivering a spoken briefing through glasses TTS. Be concise, natural, and conversational. No filler words. No greetings.\n\n${briefingContext}`,
+          messages: [{ role: 'user', content: briefingPrompt }]
+        }, 'glasses-briefing')
+        fullText = fallbackResponse.content?.[0]?.type === 'text' ? fallbackResponse.content[0].text ?? '' : ''
+        if (ttsStream && fullText) ttsStream.sendChunk(fullText)
+      } catch (fallbackErr: any) {
+        console.error(`[glasses] Briefing fallback failed: ${fallbackErr.message}`)
+      }
+    }
+
+    console.log(`[glasses] briefing (${isMorning ? 'morning' : 'evening'}): ${fullText.slice(0, 100)}...`)
+
+    // Send text response
+    ws.send(JSON.stringify({ type: 'response', mode: 'briefing', text: fullText }))
+
+    // Wait for TTS to finish
+    if (ttsStream) {
+      await ttsStream.finish()
     }
   }
 
