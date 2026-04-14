@@ -246,6 +246,31 @@ export async function migrate(): Promise<void> {
         ON contacts (primary_channel);
     `)
 
+    // ── Overlay log (for suppression telemetry) ──────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS overlay_log (
+        id TEXT PRIMARY KEY,
+        timestamp TIMESTAMPTZ DEFAULT NOW(),
+        outcome TEXT NOT NULL,
+        reason TEXT,
+        entity_id TEXT,
+        insight_type TEXT,
+        confidence INT,
+        content_snapshot TEXT,
+        signals_snapshot JSONB
+      );
+      CREATE INDEX IF NOT EXISTS idx_overlay_log_ts ON overlay_log (timestamp DESC);
+      CREATE INDEX IF NOT EXISTS idx_overlay_log_entity ON overlay_log (entity_id, timestamp DESC);
+    `)
+
+    // ── Commitment surfacing counters ─────────────────────────────
+    await client.query(`
+      ALTER TABLE commitments ADD COLUMN IF NOT EXISTS auto_surface_count INT DEFAULT 0;
+      ALTER TABLE commitments ADD COLUMN IF NOT EXISTS auto_surface_clicked INT DEFAULT 0;
+      ALTER TABLE commitments ADD COLUMN IF NOT EXISTS dismissed_via_inaction BOOLEAN DEFAULT FALSE;
+      ALTER TABLE commitments ADD COLUMN IF NOT EXISTS last_surfaced_at TIMESTAMPTZ;
+    `)
+
     // ── Devices table ───────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS devices (

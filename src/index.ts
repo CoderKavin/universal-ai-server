@@ -1826,6 +1826,106 @@ FORMATTING:
 
   // ── CONTEXTUAL OVERLAY ───────────────────────────────────────
 
+  // FIX 2: Content quality gate — reject garbled / invalid overlay content.
+  function validateOverlayContent(description: string, body: string): { ok: true } | { ok: false; reason: string } {
+    const text = `${description} ${body}`
+    const desc = description || ''
+
+    if (desc.length < 10) return { ok: false, reason: 'description_too_short' }
+    if (desc.length > 300) return { ok: false, reason: 'description_too_long' }
+    if (body.length < 3 || body.length > 140) return { ok: false, reason: 'body_length_oob' }
+
+    // Ends with single capital letter + optional period: "by W", "Collab by N."
+    if (/\s[A-Z]\.?$/.test(desc.trim())) return { ok: false, reason: 'truncated_single_letter' }
+
+    // Ends mid-word — last "word" is 1-2 chars that don't form a real word
+    const trailing = desc.trim().split(/\s+/).slice(-1)[0] || ''
+    if (/^[A-Za-z]{1,2}$/.test(trailing) && !['I', 'a', 'A', 'in', 'on', 'at', 'to', 'of', 'by', 'is', 'it', 'am', 'pm'].includes(trailing)) {
+      return { ok: false, reason: 'truncated_trailing_stub' }
+    }
+
+    // Unbalanced parentheses
+    const openP = (desc.match(/\(/g) || []).length
+    const closeP = (desc.match(/\)/g) || []).length
+    if (openP !== closeP) return { ok: false, reason: 'unbalanced_parens' }
+    const openB = (desc.match(/\[/g) || []).length
+    const closeB = (desc.match(/]/g) || []).length
+    if (openB !== closeB) return { ok: false, reason: 'unbalanced_brackets' }
+
+    // Placeholder / truncation tokens
+    if (/\[(missing|placeholder|todo|\.\.\.)\]/i.test(text)) return { ok: false, reason: 'placeholder_token' }
+    if (/\bnull\b/.test(text) || /\bundefined\b/.test(text)) return { ok: false, reason: 'null_or_undefined' }
+
+    return { ok: true }
+  }
+
+  async function logOverlaySuppression(
+    pool: any,
+    outcome: string,
+    reason: string,
+    entityId: string,
+    insightType: string,
+    confidence: number,
+    contentSnapshot: string,
+    signals?: any
+  ): Promise<void> {
+    try {
+      await pool.query(
+        `INSERT INTO overlay_log (id, outcome, reason, entity_id, insight_type, confidence, content_snapshot, signals_snapshot)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [crypto.randomUUID(), outcome, reason, entityId, insightType, Math.round(confidence || 0), contentSnapshot.slice(0, 500), signals ? JSON.stringify(signals) : null]
+      )
+    } catch (err: any) {
+      console.error('[overlay-log] insert failed:', err.message)
+    }
+  }
+
+  // FIX 3: Context relevance — judge whether a proactive candidate is
+  // appropriate for the current focus state.
+  async function isProactiveRelevant(
+    pool: any,
+    candidate: any,
+    signals: { app: string; title: string; ocr: string }
+  ): Promise<{ ok: boolean; reason: string }> {
+    const appLower = signals.app || ''
+    const isDeepFocus = /code|xcode|intellij|pycharm|vim|emacs|terminal|iterm|figma|blender|unity|logic/.test(appLower)
+    const isNeutral = /chrome|safari|firefox|mail|messages|whatsapp|slack|notion|obsidian|docs|pages|word/.test(appLower)
+
+    // Time-critical = due in < 24h (for DEADLINE candidates)
+    const dueStr: string = String(candidate.title || '')
+    const dueMatch = dueStr.match(/Due (\d{4}-\d{2}-\d{2})/)
+    let timeCritical = false
+    if (dueMatch) {
+      const dueMs = new Date(dueMatch[1]).getTime()
+      timeCritical = dueMs - Date.now() < 24 * 3600000
+    }
+    // UPCOMING calendar events within 30 min are always time-critical
+    if (candidate.label === 'UPCOMING') timeCritical = true
+
+    // Topical match: does the candidate body mention any word from the signals
+    const allSignalText = `${signals.ocr} ${signals.title}`.toLowerCase()
+    const candidateText = `${candidate.title || ''} ${candidate.body || ''}`.toLowerCase()
+    const candidateTokens = candidateText.split(/[^a-z]+/).filter((w: string) => w.length >= 4)
+    const topical = candidateTokens.some((t: string) => allSignalText.includes(t))
+
+    if (timeCritical) return { ok: true, reason: 'time_critical' }
+    if (isDeepFocus && !topical) return { ok: false, reason: 'irrelevant_to_deep_focus' }
+
+    // For non-critical in neutral context, allow unless we've seen many observations recently
+    // from a different topic (user is actively working on something else)
+    if (isNeutral && topical) return { ok: true, reason: 'neutral_with_topical_match' }
+    if (isNeutral) {
+      // Check if first-5-min-of-session: any observation in last 10 min?
+      const recentRes = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM observations WHERE timestamp > NOW() - INTERVAL '10 minutes'`
+      )
+      if (recentRes.rows[0].c < 5) return { ok: true, reason: 'session_start' }
+      return { ok: false, reason: 'non_critical_no_topical_match' }
+    }
+
+    return { ok: true, reason: 'default_allow' }
+  }
+
   app.post('/api/overlay/evaluate', async (req, res) => {
     try {
       const pool = getPool()
@@ -2190,22 +2290,48 @@ FORMATTING:
           })
         }
 
-        // Check for stale high-priority commitments
+        // Check for stale high-priority commitments.
+        // FIX 1: filter to not-overdue, within 7 days, not dismissed, not overshown.
+        // Also exclude commitments that have been dismissed in correction_log recently.
+        const nowIso = new Date().toISOString()
+        const sevenDaysIso = new Date(Date.now() + 7 * 86400000).toISOString()
         const urgentCommitments = await pool.query(
-          `SELECT description, due_at, committed_to FROM commitments
-           WHERE status = 'active' AND due_at IS NOT NULL
-           AND due_at::text <= $1 ORDER BY due_at LIMIT 1`,
-          [new Date(Date.now() + 24 * 3600000).toISOString().slice(0, 10)]
+          `SELECT id, description, due_at, committed_to, auto_surface_count, auto_surface_clicked
+           FROM commitments
+           WHERE status = 'active'
+             AND (dismissed_via_inaction IS NOT TRUE)
+             AND due_at IS NOT NULL
+             AND due_at::text >= $1
+             AND due_at::text <= $2
+             AND NOT EXISTS (
+               SELECT 1 FROM correction_log cl
+               WHERE cl.timestamp > NOW() - INTERVAL '30 days'
+                 AND cl.user_action LIKE '%dismiss%'
+                 AND (cl.trigger_context ILIKE '%' || SPLIT_PART(commitments.description, ' ', 1) || '%'
+                      OR cl.trigger_action ILIKE '%' || SPLIT_PART(commitments.description, ' ', 1) || '%')
+             )
+           ORDER BY due_at ASC LIMIT 1`,
+          [nowIso, sevenDaysIso]
         )
         if (urgentCommitments.rows.length > 0) {
           const uc = urgentCommitments.rows[0]
-          insights.push({
-            type: 'proactive', label: 'DEADLINE',
-            title: `Due ${uc.due_at}: ${(uc.description || '').slice(0, 35)}`,
+          const dueDate = String(uc.due_at).slice(0, 10)
+          const candidate = {
+            type: 'proactive', label: 'DEADLINE' as const,
+            title: `Due ${dueDate}: ${(uc.description || '').slice(0, 35)}`,
             body: uc.committed_to ? `For ${uc.committed_to}` : 'Review before deadline',
-            confidence: 80, entity_id: `commitment:${uc.description?.slice(0, 20)}`,
-            upgrade: 'proactive'
-          })
+            confidence: 80, entity_id: `commitment:${uc.id}`,
+            upgrade: 'proactive',
+            _commitment_id: uc.id,
+            _auto_surface_count: uc.auto_surface_count || 0,
+          }
+          // FIX 2: content quality gate — validate description first
+          const validation = validateOverlayContent(uc.description || '', candidate.body)
+          if (!validation.ok) {
+            await logOverlaySuppression(pool, 'suppressed_garbled', validation.reason, candidate.entity_id, candidate.type, candidate.confidence, `${candidate.title} / ${candidate.body}`)
+          } else {
+            insights.push(candidate as any)
+          }
         }
       }
 
@@ -2307,6 +2433,50 @@ FORMATTING:
         best.body = (best.body || '').slice(0, 140 - (best.label || '').length - (best.title || '').length - 3) + '...'
       }
 
+      // FIX 2: final content validation on the chosen best insight
+      const finalValidation = validateOverlayContent(best.title || '', best.body || '')
+      if (!finalValidation.ok) {
+        await logOverlaySuppression(pool, 'suppressed_garbled', finalValidation.reason, best.entity_id, best.type, best.confidence, `${best.title} / ${best.body}`, { app: signals.app, title: signals.title })
+        return res.json({ show: false })
+      }
+
+      // FIX 3: context relevance for proactive fires
+      if (best.upgrade === 'proactive') {
+        const relev = await isProactiveRelevant(pool, best, { app: signals.app, title: signals.title, ocr: signals.ocr })
+        if (!relev.ok) {
+          await logOverlaySuppression(pool, 'suppressed_irrelevant', relev.reason, best.entity_id, best.type, best.confidence, `${best.title} / ${best.body}`, { app: signals.app, title: signals.title })
+          return res.json({ show: false })
+        }
+      }
+
+      // FIX 1 (cont.): track auto-surface count on commitment-based cards
+      if (best.entity_id && typeof best.entity_id === 'string' && best.entity_id.startsWith('commitment:')) {
+        const commitmentId = best.entity_id.slice('commitment:'.length)
+        try {
+          const upd = await pool.query(
+            `UPDATE commitments
+             SET auto_surface_count = COALESCE(auto_surface_count, 0) + 1,
+                 last_surfaced_at = NOW(),
+                 dismissed_via_inaction = CASE
+                   WHEN COALESCE(auto_surface_count, 0) + 1 >= 3 AND COALESCE(auto_surface_clicked, 0) = 0 THEN TRUE
+                   ELSE dismissed_via_inaction
+                 END
+             WHERE id = $1
+             RETURNING auto_surface_count, auto_surface_clicked, dismissed_via_inaction`,
+            [commitmentId]
+          )
+          if (upd.rows[0]?.dismissed_via_inaction === true) {
+            await logOverlaySuppression(pool, 'suppressed_inaction_capped', 'auto_surface_count_hit_threshold', best.entity_id, best.type, best.confidence, `${best.title} / ${best.body}`)
+            return res.json({ show: false })
+          }
+        } catch (err: any) {
+          console.error('[overlay] commitment surface tracking failed:', err.message)
+        }
+      }
+
+      // Log the successful fire for telemetry
+      await logOverlaySuppression(pool, 'fired', 'ok', best.entity_id, best.type, best.confidence, `${best.title} / ${best.body}`, { app: signals.app, title: signals.title })
+
       res.json({
         show: true,
         id: `overlay-${Date.now()}`,
@@ -2315,6 +2485,24 @@ FORMATTING:
     } catch (err: any) {
       console.error('[overlay] Evaluate failed:', err.message)
       res.json({ show: false })
+    }
+  })
+
+  // Track overlay action clicks (for auto-surface counter)
+  app.post('/api/overlay/action', async (req, res) => {
+    try {
+      const pool = getPool()
+      const { entity_id } = req.body || {}
+      if (typeof entity_id === 'string' && entity_id.startsWith('commitment:')) {
+        const commitmentId = entity_id.slice('commitment:'.length)
+        await pool.query(
+          `UPDATE commitments SET auto_surface_clicked = COALESCE(auto_surface_clicked, 0) + 1 WHERE id = $1`,
+          [commitmentId]
+        )
+      }
+      res.json({ ok: true })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
     }
   })
 
@@ -2472,6 +2660,62 @@ FORMATTING:
       }
       res.json({ ok: true, moved_email: src.rows[0].email, from: from_provider, to: to_provider })
     } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Commitments audit: garbled content, overdue, surfacing history
+  app.get('/api/admin/commitments-audit', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const total = await pool.query(`SELECT COUNT(*)::int AS c FROM commitments`)
+      const overdue = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM commitments
+         WHERE due_at IS NOT NULL AND due_at::text < NOW()::text AND status = 'active'`
+      )
+      const active = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM commitments WHERE status = 'active'`
+      )
+      const upcoming7d = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM commitments
+         WHERE status = 'active' AND due_at IS NOT NULL
+         AND due_at::text >= NOW()::text
+         AND due_at::text <= (NOW() + INTERVAL '7 days')::text`
+      )
+      // Find likely-garbled rows: ending with single char + space, unbalanced parens,
+      // truncation indicators, too-short or missing
+      const garbled = await pool.query(
+        `SELECT id, description, committed_to, committed_by, due_at, source_type, source_ref, created_at
+         FROM commitments
+         WHERE status = 'active'
+         AND (
+           description ~ '\\s[A-Z]\\.?$'           -- ends with single capital letter ('by W')
+           OR description ~ '\\s\\S$'              -- ends mid-word (single char after space)
+           OR description LIKE '%(%' AND description NOT LIKE '%)%'  -- unbalanced open paren
+           OR description LIKE '%[missing]%'
+           OR description LIKE '%[...]%'
+           OR LENGTH(description) < 10
+           OR LENGTH(description) > 300
+         )
+         ORDER BY created_at DESC LIMIT 30`
+      )
+      const kahilCas = await pool.query(
+        `SELECT id, description, source_type, source_ref, due_at, created_at
+         FROM commitments
+         WHERE description ILIKE '%Kahil%' OR description ILIKE '%CAS WLFLO%' OR description ILIKE '%by W%'
+         LIMIT 10`
+      )
+      res.json({
+        total: total.rows[0].c,
+        active: active.rows[0].c,
+        overdue: overdue.rows[0].c,
+        upcoming_next_7_days: upcoming7d.rows[0].c,
+        garbled_candidates_count: garbled.rows.length,
+        garbled_samples: garbled.rows,
+        kahil_or_cas_matches: kahilCas.rows,
+      })
+    } catch (err: any) {
+      console.error('[commitments-audit] Error:', err.message)
       res.status(500).json({ error: err.message })
     }
   })
