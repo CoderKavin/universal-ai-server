@@ -1863,13 +1863,18 @@ FORMATTING:
       const contacts = signalNames.size > 0
         ? await pool.query(
             `SELECT name, email, current_closeness, trajectory, anomaly, last_interaction,
-                    interaction_freq_30d, whatsapp_msgs_30d, email_count_30d
+                    interaction_freq_30d, whatsapp_msgs_30d, email_count_30d,
+                    CASE
+                      WHEN LOWER(SPLIT_PART(name, ' ', 1)) = ANY($1::text[]) THEN 1000
+                      WHEN LOWER(SPLIT_PART(email, '@', 1)) = ANY($1::text[]) THEN 999
+                      ELSE current_closeness
+                    END AS _priority
              FROM relationships
              WHERE current_closeness > 5
              AND (LOWER(SPLIT_PART(name, ' ', 1)) = ANY($1::text[])
                   OR LOWER(SPLIT_PART(email, '@', 1)) = ANY($1::text[])
                   OR current_closeness >= 20)
-             ORDER BY current_closeness DESC LIMIT 50`,
+             ORDER BY _priority DESC, current_closeness DESC LIMIT 50`,
             [Array.from(signalNames)]
           )
         : await pool.query(
