@@ -2420,12 +2420,51 @@ FORMATTING:
 
   app.post('/api/sync/trigger', async (req, res) => {
     try {
-      const service = req.body?.service as string | undefined
+      const service = (req.body?.service || req.body?.source) as string | undefined
       const { triggerSync } = await import('./sync-scheduler')
       await triggerSync(service as any)
       const { getSyncStatus } = await import('./sync-scheduler')
       const status = await getSyncStatus()
       res.json({ ok: true, triggered: service || 'all', status })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Calendar diagnostic: counts + next upcoming events + tokens/sync_state
+  app.get('/api/admin/calendar-diag', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const total = await pool.query(`SELECT COUNT(*)::int AS c FROM calendar_events`)
+      const upcoming = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM calendar_events
+         WHERE start_time::timestamptz > NOW() AND COALESCE(status,'confirmed') != 'cancelled'`
+      )
+      const next5 = await pool.query(
+        `SELECT id, summary, start_time, end_time, calendar_name, participants, status
+         FROM calendar_events WHERE start_time::timestamptz > NOW()
+         ORDER BY start_time::timestamptz LIMIT 5`
+      )
+      const byCalendar = await pool.query(
+        `SELECT calendar_name, COUNT(*)::int AS c FROM calendar_events
+         GROUP BY calendar_name ORDER BY c DESC`
+      )
+      const tokens = await pool.query(
+        `SELECT provider, email, expiry_date, updated_at FROM oauth_tokens ORDER BY updated_at DESC`
+      )
+      const syncState = await pool.query(
+        `SELECT integration, last_sync_at, status, total_processed FROM sync_state ORDER BY integration`
+      )
+      res.json({
+        calendar_events: {
+          total: total.rows[0].c,
+          upcoming_from_now: upcoming.rows[0].c,
+          next_5_upcoming: next5.rows,
+          by_calendar_name: byCalendar.rows,
+        },
+        oauth_tokens: tokens.rows,
+        sync_state: syncState.rows,
+      })
     } catch (err: any) {
       res.status(500).json({ error: err.message })
     }
@@ -2437,6 +2476,139 @@ FORMATTING:
       const status = await getSyncStatus()
       res.json(status)
     } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── Devices (phone app registration / heartbeat / listing) ─────
+
+  app.post('/api/devices/register', async (req, res) => {
+    try {
+      const pool = getPool()
+      const { device_type, device_id, device_name, os, os_version, app_version, user_id } = req.body || {}
+      if (!device_type || !device_id) {
+        res.status(400).json({ error: 'device_type and device_id required' }); return
+      }
+      const existing = await pool.query(`SELECT id FROM devices WHERE device_id = $1`, [device_id])
+      const id = existing.rows[0]?.id || crypto.randomUUID()
+      await pool.query(
+        `INSERT INTO devices (id, user_id, device_type, device_id, device_name, os, os_version, app_version, last_seen, is_active)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), TRUE)
+         ON CONFLICT (device_id) DO UPDATE SET
+           user_id = COALESCE(EXCLUDED.user_id, devices.user_id),
+           device_type = EXCLUDED.device_type,
+           device_name = COALESCE(EXCLUDED.device_name, devices.device_name),
+           os = COALESCE(EXCLUDED.os, devices.os),
+           os_version = COALESCE(EXCLUDED.os_version, devices.os_version),
+           app_version = COALESCE(EXCLUDED.app_version, devices.app_version),
+           last_seen = NOW(),
+           is_active = TRUE,
+           updated_at = NOW()`,
+        [id, user_id || null, device_type, device_id, device_name || null, os || null, os_version || null, app_version || null]
+      )
+      res.json({ ok: true, device_id })
+    } catch (err: any) {
+      console.error('[devices/register] Error:', err.message)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.patch('/api/devices/:device_id/heartbeat', async (req, res) => {
+    try {
+      const pool = getPool()
+      const deviceId = req.params.device_id
+      const r = await pool.query(
+        `UPDATE devices SET last_seen = NOW(), updated_at = NOW(), is_active = TRUE
+         WHERE device_id = $1 RETURNING last_seen`,
+        [deviceId]
+      )
+      if (r.rowCount === 0) { res.status(404).json({ error: 'device not found' }); return }
+      res.json({ ok: true, last_seen: r.rows[0].last_seen })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/devices', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const r = await pool.query(
+        `SELECT id, user_id, device_type, device_id, device_name, os, os_version, app_version,
+                last_seen, is_active, created_at, updated_at,
+                EXTRACT(EPOCH FROM (NOW() - last_seen))::int AS seconds_since_seen
+         FROM devices ORDER BY last_seen DESC`
+      )
+      const devices = r.rows.map((d: any) => {
+        const s = Number(d.seconds_since_seen || 0)
+        let status: 'online' | 'away' | 'offline'
+        if (s < 5 * 60) status = 'online'
+        else if (s < 60 * 60) status = 'away'
+        else status = 'offline'
+        return { ...d, status }
+      })
+      res.json({ devices })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/status', async (_req, res) => {
+    try {
+      const pool = getPool()
+
+      // Devices with status
+      const devRes = await pool.query(
+        `SELECT device_type, device_id, device_name, os, last_seen,
+                EXTRACT(EPOCH FROM (NOW() - last_seen))::int AS seconds_since_seen
+         FROM devices ORDER BY last_seen DESC`
+      )
+      const devices = devRes.rows.map((d: any) => {
+        const s = Number(d.seconds_since_seen || 0)
+        let status: 'online' | 'away' | 'offline'
+        if (s < 5 * 60) status = 'online'
+        else if (s < 60 * 60) status = 'away'
+        else status = 'offline'
+        return { ...d, status }
+      })
+
+      // Sync state
+      let sync_state: any = {}
+      try {
+        const { getSyncStatus } = await import('./sync-scheduler')
+        sync_state = await getSyncStatus()
+      } catch {}
+
+      // Observation rate (last hour)
+      const rateRes = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM observations WHERE timestamp > NOW() - INTERVAL '1 hour'`
+      )
+      const observation_rate = rateRes.rows[0].c
+
+      // Last observation
+      const lastRes = await pool.query(
+        `SELECT timestamp FROM observations ORDER BY timestamp DESC LIMIT 1`
+      )
+      const last_observation_ts = lastRes.rows[0]?.timestamp || null
+
+      // Persona freshness: rewrite age
+      const personaRes = await pool.query(
+        `SELECT updated_at, EXTRACT(EPOCH FROM (NOW() - updated_at))::int AS age_s
+         FROM living_profile LIMIT 1`
+      )
+      let persona_freshness: 'fresh' | 'aging' | 'stale' = 'stale'
+      const ageS = Number(personaRes.rows[0]?.age_s || Number.MAX_SAFE_INTEGER)
+      if (ageS < 6 * 3600) persona_freshness = 'fresh'
+      else if (ageS < 48 * 3600) persona_freshness = 'aging'
+
+      res.json({
+        devices,
+        sync_state,
+        observation_rate,
+        persona_freshness,
+        last_observation_ts,
+      })
+    } catch (err: any) {
+      console.error('[status] Error:', err.message)
       res.status(500).json({ error: err.message })
     }
   })
