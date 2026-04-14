@@ -2671,6 +2671,58 @@ FORMATTING:
     ws.send(frame)
   }
 
+  // ── Glasses helpers: text sanitization for TTS ─────────────────
+
+  /** Strip forbidden characters so the user never hears them spoken. */
+  function sanitizeForTTS(text: string): string {
+    return text
+      // Em dash, en dash, figure dash, horizontal bar → period+space
+      .replace(/[—–‒―]/g, '. ')
+      // Strip markdown/visual characters entirely
+      .replace(/[*_`[\]{}|\\<>]/g, '')
+      // Strip parentheses (keep the content)
+      .replace(/[()]/g, '')
+      // Bullet points and list markers
+      .replace(/^[\s]*[•·▪▫●○]\s*/gm, '')
+      // Slashes between words → "or" feels unnatural; use space
+      .replace(/(\w)\/(\w)/g, '$1 or $2')
+      // Collapse multiple spaces
+      .replace(/\s+/g, ' ')
+      // Collapse ". ." repeats from the em dash replacement
+      .replace(/\.\s*\./g, '.')
+      .trim()
+  }
+
+  // ── Glasses helpers: query classification for token budgeting ──
+
+  type GlassesQueryType = 'command' | 'factual' | 'analytical'
+
+  function classifyGlassesQuery(transcript: string): GlassesQueryType {
+    const lower = transcript.toLowerCase().trim().replace(/[.!?,]+$/, '')
+    const wordCount = lower.split(/\s+/).filter(Boolean).length
+
+    // Short commands: "send it", "approve", "skip", "remind me later"
+    if (wordCount <= 4 &&
+        /^(send|approve|cancel|skip|yes|no|done|reject|accept|ok|okay|dismiss|snooze|remind|confirm|go|stop|pause|resume|next|more|delete|save|archive|mute|unmute)\b/.test(lower)) {
+      return 'command'
+    }
+
+    // Factual: yes/no questions, specific-info queries
+    if (/^(what time|what's the time|when is|when's|when does|where is|where's|who is|who's|who was|did |does |is |are |was |were |do i|did i|have i|has |how many|how much|how long|what day|what date|what's my|what are my|how's)/.test(lower)) {
+      return 'factual'
+    }
+
+    return 'analytical'
+  }
+
+  function maxTokensFor(type: GlassesQueryType): number {
+    switch (type) {
+      case 'command':    return 15
+      case 'factual':    return 40
+      case 'analytical': return 80
+    }
+  }
+
   // ── Cartesia WebSocket streaming TTS ──────────────────────────
 
   /**
@@ -2835,13 +2887,17 @@ LENGTH:
 
 LANGUAGE:
 - Use contractions always: don't, can't, won't, haven't, hasn't, you're, they're, it's, there's, would've, should've, I've, you've. Never use the uncontracted form.
-- No em dashes, brackets, parentheses, slashes, colons used as list separators, or any punctuation that doesn't translate to speech.
+- FORBIDDEN CHARACTERS: em dash (—), en dash (–), bullet points, parentheses, brackets, asterisks, slashes, pipes, backticks, underscores. If you need to separate two thoughts, use a period and start a new sentence.
 - No numbered lists unless the user explicitly asks for a list. No bullet points or visual formatting.
 - Numbers under ten: spell as words. "three days" not "3 days". Numbers over ten can stay numeric.
 - Times: speak naturally. "two fifteen" not "14:15" or "2:15 PM".
 - Dates: speak naturally. "April twentieth" not "Apr 20" or "20/04".
 - Currency: spell out. "six thousand rupees" not "₹6000".
 - IB abbreviations: say "Extended Essay" when context allows, otherwise "E E". "I B" letter by letter. "C A S" letter by letter. "T O K" letter by letter. "I A" letter by letter.
+
+TOKEN BUDGET:
+- You have a strict token budget. Every word must earn its place. If you can't say it in the budget, pick the single most important thing and say only that.
+- Do not pad. Do not explain. Do not list more than you must.
 
 TONE:
 - Warm but not sycophantic. Use "I" and "you" directly. "I checked your calendar" is fine.
@@ -2943,13 +2999,18 @@ Evening: "Solid day. You cleared the Physics assignment and two Centrum cards. S
     let tFirstAudio = 0
     const tClaudeStart = Date.now()
 
+    // Classify query type to enforce hard max_tokens budget
+    const glassesType = classifyGlassesQuery(transcript)
+    const budgetedMaxTokens = maxTokensFor(glassesType)
+    console.log(`[glasses] query type: ${glassesType} (max_tokens: ${budgetedMaxTokens})`)
+
     try {
       // Wait for Cartesia WS to be ready before starting Claude stream
       await ttsStream.ready
 
       const stream = client.messages.stream({
         model: settings.model || 'claude-sonnet-4-20250514',
-        max_tokens: 150,
+        max_tokens: budgetedMaxTokens,
         system: [
           { type: 'text', text: GLASSES_IRIS_RULES, cache_control: { type: 'ephemeral' } as any },
           { type: 'text', text: `\nCONTEXT:\n${context}`, cache_control: { type: 'ephemeral' } as any }
@@ -2968,7 +3029,8 @@ Evening: "Solid day. You cleared the Physics assignment and two Centrum cards. S
 
           // Send to Cartesia when we accumulate a sentence boundary or 80+ chars
           if (sentenceBoundary.test(textBuffer) || textBuffer.length >= 80) {
-            ttsStream.sendChunk(textBuffer)
+            const clean = sanitizeForTTS(textBuffer)
+            if (clean) ttsStream.sendChunk(clean)
             if (!tFirstAudio) tFirstAudio = Date.now()
             textBuffer = ''
           }
@@ -2977,7 +3039,8 @@ Evening: "Solid day. You cleared the Physics assignment and two Centrum cards. S
 
       // Flush any remaining text
       if (textBuffer.trim()) {
-        ttsStream.sendChunk(textBuffer)
+        const clean = sanitizeForTTS(textBuffer)
+        if (clean) ttsStream.sendChunk(clean)
         if (!tFirstAudio) tFirstAudio = Date.now()
       }
     } catch (err: any) {
@@ -2986,7 +3049,7 @@ Evening: "Solid day. You cleared the Physics assignment and two Centrum cards. S
       try {
         const fallbackResponse = await claudeWithFallback(client, {
           model: settings.model || 'claude-sonnet-4-20250514',
-          max_tokens: 150,
+          max_tokens: budgetedMaxTokens,
           system: [
             { type: 'text', text: GLASSES_IRIS_RULES, cache_control: { type: 'ephemeral' } },
             { type: 'text', text: `\nCONTEXT:\n${context}`, cache_control: { type: 'ephemeral' } }
@@ -2995,7 +3058,8 @@ Evening: "Solid day. You cleared the Physics assignment and two Centrum cards. S
         }, 'glasses-voice-fallback')
         fullText = fallbackResponse.content?.[0]?.type === 'text' ? fallbackResponse.content[0].text ?? '' : ''
         if (fullText) {
-          ttsStream.sendChunk(fullText)
+          const clean = sanitizeForTTS(fullText)
+          if (clean) ttsStream.sendChunk(clean)
           if (!tFirstAudio) tFirstAudio = Date.now()
         }
       } catch (fallbackErr: any) {
@@ -3013,14 +3077,17 @@ Evening: "Solid day. You cleared the Physics assignment and two Centrum cards. S
       return
     }
 
+    // Sanitize for display/storage (match what the user actually heard)
+    const cleanFullText = sanitizeForTTS(fullText)
+
     // Store in query memory
-    const entities = extractEntitiesFromText(fullText, transcript)
-    insertQueryMemory(transcript, fullText, entities).catch(() => {})
+    const entities = extractEntitiesFromText(cleanFullText, transcript)
+    insertQueryMemory(transcript, cleanFullText, entities).catch(() => {})
 
     // Send text response (for logging/display on companion app)
     const degradationNote = getDegradationWhisper()
     ws.send(JSON.stringify({
-      type: 'response', mode: 'voice', text: fullText,
+      type: 'response', mode: 'voice', text: cleanFullText,
       conversation_active: true,
       listen_after: 5.0,
       ...(degradationNote ? { whisper: degradationNote } : {})
@@ -3112,7 +3179,7 @@ Deliver as natural sentences, like a personal assistant wrapping up the day. Ref
 
       const stream = client.messages.stream({
         model: settings.model || 'claude-sonnet-4-20250514',
-        max_tokens: 200,
+        max_tokens: 100,
         system: `${GLASSES_IRIS_RULES}\n\n${GLASSES_BRIEFING_RULES}\n\n${briefingContext}`,
         messages: [{ role: 'user', content: briefingPrompt }]
       })
@@ -3126,35 +3193,41 @@ Deliver as natural sentences, like a personal assistant wrapping up the day. Ref
           textBuffer += event.delta.text
 
           if (ttsStream && (sentenceBoundary.test(textBuffer) || textBuffer.length >= 80)) {
-            ttsStream.sendChunk(textBuffer)
+            const clean = sanitizeForTTS(textBuffer)
+            if (clean) ttsStream.sendChunk(clean)
             textBuffer = ''
           }
         }
       }
 
       if (ttsStream && textBuffer.trim()) {
-        ttsStream.sendChunk(textBuffer)
+        const clean = sanitizeForTTS(textBuffer)
+        if (clean) ttsStream.sendChunk(clean)
       }
     } catch (err: any) {
       console.error(`[glasses] Briefing stream error: ${err.message} — trying fallback`)
       try {
         const fallbackResponse = await claudeWithFallback(client, {
           model: settings.model || 'claude-sonnet-4-20250514',
-          max_tokens: 200,
+          max_tokens: 100,
           system: `${GLASSES_IRIS_RULES}\n\n${GLASSES_BRIEFING_RULES}\n\n${briefingContext}`,
           messages: [{ role: 'user', content: briefingPrompt }]
         }, 'glasses-briefing')
         fullText = fallbackResponse.content?.[0]?.type === 'text' ? fallbackResponse.content[0].text ?? '' : ''
-        if (ttsStream && fullText) ttsStream.sendChunk(fullText)
+        if (ttsStream && fullText) {
+          const clean = sanitizeForTTS(fullText)
+          if (clean) ttsStream.sendChunk(clean)
+        }
       } catch (fallbackErr: any) {
         console.error(`[glasses] Briefing fallback failed: ${fallbackErr.message}`)
       }
     }
 
-    console.log(`[glasses] briefing (${isMorning ? 'morning' : 'evening'}): ${fullText.slice(0, 100)}...`)
+    const cleanFullText = sanitizeForTTS(fullText)
+    console.log(`[glasses] briefing (${isMorning ? 'morning' : 'evening'}): ${cleanFullText.slice(0, 100)}...`)
 
     // Send text response
-    ws.send(JSON.stringify({ type: 'response', mode: 'briefing', text: fullText }))
+    ws.send(JSON.stringify({ type: 'response', mode: 'briefing', text: cleanFullText }))
 
     // Wait for TTS to finish
     if (ttsStream) {
