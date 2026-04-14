@@ -162,7 +162,7 @@ async function upsertWhatsAppContact(info: {
       const row = byPhone.rows[0]
       await pool.query(
         `UPDATE contacts
-         SET whatsapp_msgs_total = COALESCE(whatsapp_msgs_total, 0) + $1,
+         SET whatsapp_msgs_total = COALESCE(whatsapp_msgs_total, 0) + $1::int,
              last_whatsapp_at = GREATEST(COALESCE(last_whatsapp_at, $2::timestamptz), $2::timestamptz),
              updated_at = NOW()
          WHERE id = $3`,
@@ -172,11 +172,12 @@ async function upsertWhatsAppContact(info: {
     }
     // New phone-only contact
     const id = crypto.randomUUID()
+    const tsText = typeof info.latestTs === 'string' ? info.latestTs : new Date(info.latestTs).toISOString()
     await pool.query(
       `INSERT INTO contacts (id, name, phone, primary_channel, whatsapp_msgs_total, last_whatsapp_at, last_interaction_at, needs_manual_merge)
-       VALUES ($1, $2, $3, 'whatsapp', $4, $5, $5, TRUE)
+       VALUES ($1, $2, $3, 'whatsapp', $4::int, $5::timestamptz, $6::text, TRUE)
        ON CONFLICT (phone) DO NOTHING`,
-      [id, `Unknown (${info.phone})`, info.phone, info.msgs, info.latestTs]
+      [id, `Unknown (${info.phone})`, info.phone, info.msgs, tsText, tsText]
     )
     return { action: 'created' }
   }
@@ -192,14 +193,15 @@ async function upsertWhatsAppContact(info: {
       [nameLower]
     )
     if (byDisplay.rows.length > 0) {
+      const tsText = typeof info.latestTs === 'string' ? info.latestTs : new Date(info.latestTs).toISOString()
       await pool.query(
         `UPDATE contacts
-         SET whatsapp_msgs_total = COALESCE(whatsapp_msgs_total, 0) + $1,
+         SET whatsapp_msgs_total = COALESCE(whatsapp_msgs_total, 0) + $1::int,
              last_whatsapp_at = GREATEST(COALESCE(last_whatsapp_at, $2::timestamptz), $2::timestamptz),
-             last_interaction_at = $2,
+             last_interaction_at = $3::text,
              updated_at = NOW()
-         WHERE id = $3`,
-        [info.msgs, info.latestTs, byDisplay.rows[0].id]
+         WHERE id = $4`,
+        [info.msgs, tsText, tsText, byDisplay.rows[0].id]
       )
       return { action: 'updated' }
     }
@@ -214,18 +216,20 @@ async function upsertWhatsAppContact(info: {
          AND email IS NOT NULL`,
       [firstName]
     )
+    const tsText = typeof info.latestTs === 'string' ? info.latestTs : new Date(info.latestTs).toISOString()
+
     if (mergeCandidates.rows.length === 1) {
       // Merge into the existing email contact
       const existing = mergeCandidates.rows[0]
       await pool.query(
         `UPDATE contacts
          SET whatsapp_display_name = $1,
-             whatsapp_msgs_total = COALESCE(whatsapp_msgs_total, 0) + $2,
+             whatsapp_msgs_total = COALESCE(whatsapp_msgs_total, 0) + $2::int,
              last_whatsapp_at = GREATEST(COALESCE(last_whatsapp_at, $3::timestamptz), $3::timestamptz),
              primary_channel = 'both',
              updated_at = NOW()
          WHERE id = $4`,
-        [info.displayName, info.msgs, info.latestTs, existing.id]
+        [info.displayName, info.msgs, tsText, existing.id]
       )
       return { action: 'merged' }
     }
@@ -235,9 +239,8 @@ async function upsertWhatsAppContact(info: {
       const id = crypto.randomUUID()
       await pool.query(
         `INSERT INTO contacts (id, name, whatsapp_display_name, primary_channel, whatsapp_msgs_total, last_whatsapp_at, last_interaction_at, needs_manual_merge)
-         VALUES ($1, $2, $3, 'whatsapp', $4, $5, $5, TRUE)
-         ON CONFLICT (email) DO NOTHING`,
-        [id, info.displayName, info.displayName, info.msgs, info.latestTs]
+         VALUES ($1, $2, $3, 'whatsapp', $4::int, $5::timestamptz, $6::text, TRUE)`,
+        [id, info.displayName, info.displayName, info.msgs, tsText, tsText]
       )
       return { action: 'ambiguous' }
     }
@@ -246,9 +249,8 @@ async function upsertWhatsAppContact(info: {
     const id = crypto.randomUUID()
     await pool.query(
       `INSERT INTO contacts (id, name, whatsapp_display_name, primary_channel, whatsapp_msgs_total, last_whatsapp_at, last_interaction_at, needs_manual_merge)
-       VALUES ($1, $2, $3, 'whatsapp', $4, $5, $5, FALSE)
-       ON CONFLICT (email) DO NOTHING`,
-      [id, info.displayName, info.displayName, info.msgs, info.latestTs]
+       VALUES ($1, $2, $3, 'whatsapp', $4::int, $5::timestamptz, $6::text, FALSE)`,
+      [id, info.displayName, info.displayName, info.msgs, tsText, tsText]
     )
     return { action: 'created' }
   }
