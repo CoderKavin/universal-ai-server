@@ -2184,16 +2184,29 @@ FORMATTING:
       insights.sort((a, b) => b.confidence - a.confidence)
       let best = insights[0]
 
+      // Helper: derive a short, broad search token from an entity_id
+      // Handles emails (rajeev.kumartk@... → rajeev), commitments (commitment:Foo → Foo),
+      // thread-ids (thread-19ba... → thread-19ba...), and plain names.
+      const coreSearchToken = (entityId: string): string => {
+        if (!entityId) return ''
+        const afterColon = entityId.split(':').pop() || entityId
+        const beforeAt = afterColon.split('@')[0]
+        const firstAlpha = beforeAt.split(/[^a-zA-Z0-9-]/)[0] // split on dots, spaces, etc.
+        return firstAlpha.slice(0, 20)
+      }
+
       // ── UPGRADE 3: Cross-source enrichment ─────────────────────
       if (best.entity_id) {
-        const entitySearch = best.entity_id
+        const shortToken = coreSearchToken(best.entity_id)
+        const longToken = (best.entity_id.split('@')[0].split(':').pop() || '').slice(0, 25)
         // Check calendar for upcoming events with this entity
         const calMatch = await pool.query(
           `SELECT summary, start_time FROM calendar_events
            WHERE start_time::timestamptz > NOW() AND start_time::timestamptz < NOW() + INTERVAL '7 days'
-           AND (summary ILIKE $1 OR participants ILIKE $1) AND status != 'cancelled'
+           AND (summary ILIKE $1 OR participants ILIKE $1 OR summary ILIKE $2 OR participants ILIKE $2)
+           AND status != 'cancelled'
            ORDER BY start_time::timestamptz LIMIT 1`,
-          [`%${entitySearch.split('@')[0].split(':').pop()?.slice(0, 15)}%`]
+          [`%${shortToken}%`, `%${longToken}%`]
         )
         // Check chains for this entity
         const chainMatch = await pool.query(
@@ -2203,9 +2216,10 @@ FORMATTING:
            LEFT JOIN chain_steps cs2 ON cs2.chain_id = ac.id AND cs2.step_number = 2
            LEFT JOIN chain_steps cs3 ON cs3.chain_id = ac.id AND cs3.step_number = 3
            WHERE ac.status = 'active'
-           AND (ac.trigger_event ILIKE $1 OR ac.trigger_entity ILIKE $2)
+           AND (ac.trigger_event ILIKE $1 OR ac.trigger_entity ILIKE $1
+                OR ac.trigger_event ILIKE $2 OR ac.trigger_entity ILIKE $2)
            LIMIT 1`,
-          [`%${entitySearch.split('@')[0].split(':').pop()?.slice(0, 15)}%`, `%${entitySearch}%`]
+          [`%${shortToken}%`, `%${longToken}%`]
         )
 
         // UPGRADE 7: Attach chain hint
@@ -2231,22 +2245,26 @@ FORMATTING:
 
       // ── UPGRADE 5: Pattern comparison (past similar items) ─────
       if (best.entity_id && best.type !== 'predictive') {
+        const shortToken = coreSearchToken(best.entity_id)
         const pastSimilar = await pool.query(
           `SELECT trigger_action, trigger_context, user_action, correction_text
            FROM correction_log
-           WHERE trigger_context ILIKE $1 AND timestamp > NOW() - INTERVAL '30 days'
-           ORDER BY timestamp DESC LIMIT 3`,
-          [`%${best.entity_id.split('@')[0].split(':').pop()?.slice(0, 12)}%`]
+           WHERE (trigger_context ILIKE $1 OR trigger_action ILIKE $1)
+           AND timestamp > NOW() - INTERVAL '90 days'
+           ORDER BY timestamp DESC LIMIT 5`,
+          [`%${shortToken}%`]
         )
-        const dismissed = pastSimilar.rows.filter((r: any) => r.user_action?.includes('dismiss'))
-        if (dismissed.length >= 2 && pastSimilar.rows.length >= 3) {
-          // Past pattern: user dismisses this type — lower confidence
+        const dismissed = pastSimilar.rows.filter((r: any) =>
+          r.user_action?.includes('dismiss'))
+        const acted = pastSimilar.rows.filter((r: any) =>
+          r.user_action?.includes('acted') || r.user_action === 'action_taken' || r.user_action === 'approved')
+        if (dismissed.length >= 2) {
           best.confidence -= 15
+          best.pattern_score = `dismissed ${dismissed.length}× in past 90d`
         }
-        const acted = pastSimilar.rows.filter((r: any) => r.user_action?.includes('acted'))
         if (acted.length >= 2) {
-          // Past pattern: user acts on this type — boost confidence
           best.confidence += 5
+          best.pattern_score = `approved ${acted.length}× in past 90d`
         }
       }
 
