@@ -2431,6 +2431,51 @@ FORMATTING:
     }
   })
 
+  // Reclassify the 'primary' oauth slot as 'school' without re-auth,
+  // so the personal account can be connected to the primary slot.
+  app.post('/api/admin/reclassify-oauth', async (req, res) => {
+    try {
+      const pool = getPool()
+      const { from_provider, to_provider } = req.body || {}
+      if (!from_provider || !to_provider) {
+        res.status(400).json({ error: 'from_provider and to_provider required' }); return
+      }
+      if (!['google', 'google_school'].includes(from_provider) || !['google', 'google_school'].includes(to_provider)) {
+        res.status(400).json({ error: 'provider must be google or google_school' }); return
+      }
+      // Ensure destination slot is empty, else the user would clobber it
+      const dest = await pool.query(`SELECT email FROM oauth_tokens WHERE provider = $1`, [to_provider])
+      if (dest.rows.length > 0) {
+        res.status(409).json({ error: `${to_provider} slot already has ${dest.rows[0].email} — cannot reclassify without overwrite` }); return
+      }
+      const src = await pool.query(`SELECT email FROM oauth_tokens WHERE provider = $1`, [from_provider])
+      if (src.rows.length === 0) {
+        res.status(404).json({ error: `${from_provider} slot is empty` }); return
+      }
+      await pool.query(`UPDATE oauth_tokens SET provider = $1 WHERE provider = $2`, [to_provider, from_provider])
+      // Also rename sync_state rows
+      if (from_provider === 'google' && to_provider === 'google_school') {
+        for (const int of ['gmail', 'calendar', 'drive']) {
+          await pool.query(
+            `UPDATE sync_state SET integration = $1 WHERE integration = $2`,
+            [`${int}_school`, int]
+          )
+        }
+      } else if (from_provider === 'google_school' && to_provider === 'google') {
+        for (const int of ['gmail_school', 'calendar_school', 'drive_school']) {
+          const base = int.replace('_school', '')
+          await pool.query(
+            `UPDATE sync_state SET integration = $1 WHERE integration = $2`,
+            [base, int]
+          )
+        }
+      }
+      res.json({ ok: true, moved_email: src.rows[0].email, from: from_provider, to: to_provider })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
   // Calendar diagnostic: counts + next upcoming events + tokens/sync_state
   app.get('/api/admin/calendar-diag', async (_req, res) => {
     try {
