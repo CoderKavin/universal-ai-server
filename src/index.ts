@@ -2710,6 +2710,142 @@ FORMATTING:
     }
   })
 
+  // Diagnostic: WhatsApp / contacts / relationships breakdown
+  app.get('/api/admin/whatsapp-diag', async (_req, res) => {
+    try {
+      const pool = getPool()
+
+      const tablesRes = await pool.query(
+        `SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename`
+      )
+      const allTables = tablesRes.rows.map((r: any) => r.tablename)
+      const whatsappTables = allTables.filter((t: string) => t.toLowerCase().includes('whatsapp'))
+
+      const contactsTotal = await pool.query(`SELECT COUNT(*)::int AS c FROM contacts`)
+      const contactsWithEmail = await pool.query(`SELECT COUNT(*)::int AS c FROM contacts WHERE email IS NOT NULL AND email != ''`)
+      const contactsEmailNull = await pool.query(`SELECT COUNT(*)::int AS c FROM contacts WHERE email IS NULL OR email = ''`)
+      const contactColumns = await pool.query(
+        `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'contacts' ORDER BY ordinal_position`
+      )
+
+      const relationshipsTotal = await pool.query(`SELECT COUNT(*)::int AS c FROM relationships`)
+      const relWithEmail = await pool.query(`SELECT COUNT(*)::int AS c FROM relationships WHERE email IS NOT NULL AND email != ''`)
+      const relNoEmail = await pool.query(`SELECT COUNT(*)::int AS c FROM relationships WHERE email IS NULL OR email = ''`)
+      const relWithWa = await pool.query(`SELECT COUNT(*)::int AS c FROM relationships WHERE whatsapp_msgs_30d > 0`)
+      const relWaOnly = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM relationships
+         WHERE whatsapp_msgs_30d > 0 AND email_count_30d = 0`
+      )
+      const relColumns = await pool.query(
+        `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'relationships' ORDER BY ordinal_position`
+      )
+
+      const waObsTotal = await pool.query(`SELECT COUNT(*)::int AS c FROM observations WHERE source = 'whatsapp'`)
+      const waObs30d = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM observations WHERE source = 'whatsapp' AND timestamp > NOW() - INTERVAL '30 days'`
+      )
+      const waObsSample = await pool.query(
+        `SELECT id, timestamp, source, event_type, raw_content, extracted_entities
+         FROM observations WHERE source = 'whatsapp'
+         ORDER BY timestamp DESC LIMIT 5`
+      )
+
+      // Targeted lookups
+      const searchContact = async (q: string) => (
+        await pool.query(
+          `SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
+           FROM contacts WHERE LOWER(COALESCE(name,'')) LIKE $1 OR LOWER(COALESCE(email,'')) LIKE $1 LIMIT 10`,
+          [`%${q.toLowerCase()}%`]
+        )
+      ).rows
+      const searchRel = async (q: string) => (
+        await pool.query(
+          `SELECT name, email, current_closeness, trajectory, interaction_freq_30d, interaction_freq_90d,
+                  whatsapp_msgs_30d, email_count_30d, last_interaction
+           FROM relationships WHERE LOWER(COALESCE(name,'')) LIKE $1 OR LOWER(COALESCE(email,'')) LIKE $1 LIMIT 10`,
+          [`%${q.toLowerCase()}%`]
+        )
+      ).rows
+
+      const [ananyaContact, ananyaRel, sanjitContact, sanjitRel, rajeevContact, rajeevRel] = await Promise.all([
+        searchContact('ananya'), searchRel('ananya'),
+        searchContact('sanjit'), searchRel('sanjit'),
+        searchContact('rajeev'), searchRel('rajeev'),
+      ])
+
+      // Extract frequent name-like tokens from WhatsApp raw_content
+      const waAll = await pool.query(
+        `SELECT raw_content FROM observations WHERE source = 'whatsapp' LIMIT 2000`
+      )
+      const waNameCounts = new Map<string, number>()
+      for (const row of waAll.rows) {
+        const text = (row.raw_content || '').toLowerCase()
+        const toks = text.split(/[^a-z]+/).filter((w: string) => w.length >= 4 && w.length <= 20)
+        const seen = new Set<string>()
+        for (const t of toks) {
+          if (seen.has(t)) continue
+          seen.add(t)
+          waNameCounts.set(t, (waNameCounts.get(t) || 0) + 1)
+        }
+      }
+      // Only keep tokens appearing in 3+ WA rows
+      const frequentWaTokens = Array.from(waNameCounts.entries())
+        .filter(([_, n]) => n >= 3)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 50)
+
+      // Among frequent WA tokens, which do NOT have a contact record?
+      const contactFirstNames = new Set<string>()
+      const allContactsRes = await pool.query(`SELECT name FROM contacts WHERE name IS NOT NULL`)
+      for (const r of allContactsRes.rows) {
+        contactFirstNames.add(((r.name || '').trim().split(/\s+/)[0] || '').toLowerCase())
+      }
+      const STOPLIST = new Set([
+        'http','https','com','www','the','and','you','your','this','that','with','from','have','will','would','could','should','about','been','just','like','want','need','make','take','what','when','where','know','good','time','back','over','well','some','other','those','these','much','many','more','most','only','into','after','before','still','again','also','very','really','okay','today','there','here','they','their','them','then','than','which','while','were','was','are','for','but','not','all','any','can','who','how','why','our','out','off','did','get','got','put','let','see','use','one','two','ten','pls','hai','okay','yes','no'
+      ])
+      const waOnlyTokens = frequentWaTokens
+        .filter(([t]) => !contactFirstNames.has(t) && !STOPLIST.has(t))
+        .slice(0, 25)
+
+      res.json({
+        all_tables: allTables,
+        whatsapp_tables_found: whatsappTables,
+        contacts: {
+          total: contactsTotal.rows[0].c,
+          with_email: contactsWithEmail.rows[0].c,
+          email_null_or_empty: contactsEmailNull.rows[0].c,
+          columns: contactColumns.rows,
+        },
+        relationships: {
+          total: relationshipsTotal.rows[0].c,
+          with_email: relWithEmail.rows[0].c,
+          no_email: relNoEmail.rows[0].c,
+          with_whatsapp_msgs: relWithWa.rows[0].c,
+          whatsapp_only: relWaOnly.rows[0].c,
+          columns: relColumns.rows,
+        },
+        whatsapp_observations: {
+          total: waObsTotal.rows[0].c,
+          last_30d: waObs30d.rows[0].c,
+          sample_5_recent: waObsSample.rows,
+        },
+        targeted_people: {
+          ananya: { contact: ananyaContact, relationship: ananyaRel },
+          sanjit: { contact: sanjitContact, relationship: sanjitRel },
+          rajeev: { contact: rajeevContact, relationship: rajeevRel },
+        },
+        wa_name_discovery: {
+          description: 'Tokens appearing in 3+ WhatsApp observations',
+          total_frequent_tokens: frequentWaTokens.length,
+          frequent_but_no_contact_match: waOnlyTokens,
+        }
+      })
+    } catch (err: any) {
+      console.error('[admin/whatsapp-diag] Error:', err.message)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
   // Delete all test data (id LIKE 'test-overlay-%')
   app.post('/api/admin/delete-test-data', async (req, res) => {
     try {
