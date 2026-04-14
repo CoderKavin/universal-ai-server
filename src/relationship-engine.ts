@@ -67,22 +67,66 @@ export async function runRelationshipEngine(): Promise<number> {
 
   // ── 1. Load all contacts ────────────────────────────────────────
 
-  // Filter out automated/promotional senders: require emails_sent > 0 (bidirectional)
-  // This eliminates newsletters, brands, and promotional contacts
+  // Base pool: top 100 contacts by relationship_score (bidirectional, non-promotional)
+  const NOT_PROMO = `
+    email NOT LIKE '%noreply%' AND email NOT LIKE '%no-reply%'
+    AND email NOT LIKE '%notifications%' AND email NOT LIKE '%newsletter%'
+    AND email NOT LIKE '%updates%' AND email NOT LIKE '%marketing%'
+    AND email NOT LIKE '%promo%' AND email NOT LIKE '%alerts%'
+    AND email NOT LIKE '%digest%' AND email NOT LIKE '%discover%'
+    AND email NOT LIKE '%campaigns%' AND email NOT LIKE '%@e.%'
+    AND email NOT LIKE '%@mail.%' AND email NOT LIKE '%@learn.%'
+  `
+
   const contactsRes = await pool.query(
-    `SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
-     FROM contacts WHERE name IS NOT NULL
-     AND email NOT LIKE '%noreply%' AND email NOT LIKE '%no-reply%'
-     AND email NOT LIKE '%notifications%' AND email NOT LIKE '%newsletter%'
-     AND email NOT LIKE '%updates%' AND email NOT LIKE '%marketing%'
-     AND email NOT LIKE '%promo%' AND email NOT LIKE '%alerts%'
-     AND email NOT LIKE '%digest%' AND email NOT LIKE '%discover%'
-     AND email NOT LIKE '%campaigns%' AND email NOT LIKE '%@e.%'
-     AND email NOT LIKE '%@mail.%' AND email NOT LIKE '%@learn.%'
-     AND emails_sent > 0
-     ORDER BY relationship_score DESC LIMIT 100`
+    `WITH base AS (
+       SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
+       FROM contacts WHERE name IS NOT NULL AND ${NOT_PROMO} AND emails_sent > 0
+       ORDER BY relationship_score DESC LIMIT 100
+     ),
+     referenced_in_corrections AS (
+       SELECT DISTINCT c.id, c.name, c.email, c.emails_sent, c.emails_received, c.relationship_score, c.last_interaction_at
+       FROM contacts c
+       JOIN correction_log cl ON (
+         LOWER(cl.trigger_context) LIKE LOWER('%' || SPLIT_PART(COALESCE(c.name,''), ' ', 1) || '%')
+         OR LOWER(cl.trigger_action) LIKE LOWER('%' || SPLIT_PART(COALESCE(c.name,''), ' ', 1) || '%')
+       )
+       WHERE c.name IS NOT NULL AND ${NOT_PROMO}
+         AND cl.timestamp > NOW() - INTERVAL '90 days'
+         AND LENGTH(SPLIT_PART(COALESCE(c.name,''), ' ', 1)) >= 3
+     ),
+     referenced_in_predictions AS (
+       SELECT DISTINCT c.id, c.name, c.email, c.emails_sent, c.emails_received, c.relationship_score, c.last_interaction_at
+       FROM contacts c
+       JOIN predicted_actions pa ON (
+         LOWER(COALESCE(pa.description,'')) LIKE LOWER('%' || SPLIT_PART(COALESCE(c.name,''), ' ', 1) || '%')
+         OR LOWER(COALESCE(pa.title,'')) LIKE LOWER('%' || SPLIT_PART(COALESCE(c.name,''), ' ', 1) || '%')
+         OR LOWER(COALESCE(pa.related_entity,'')) LIKE LOWER('%' || SPLIT_PART(COALESCE(c.name,''), ' ', 1) || '%')
+       )
+       WHERE c.name IS NOT NULL AND ${NOT_PROMO}
+         AND pa.status = 'pending'
+         AND LENGTH(SPLIT_PART(COALESCE(c.name,''), ' ', 1)) >= 3
+     ),
+     referenced_in_recent_obs AS (
+       SELECT DISTINCT c.id, c.name, c.email, c.emails_sent, c.emails_received, c.relationship_score, c.last_interaction_at
+       FROM contacts c
+       JOIN observations o ON LOWER(o.raw_content) LIKE LOWER('%' || SPLIT_PART(COALESCE(c.name,''), ' ', 1) || '%')
+       WHERE c.name IS NOT NULL AND ${NOT_PROMO}
+         AND o.timestamp > NOW() - INTERVAL '7 days'
+         AND LENGTH(SPLIT_PART(COALESCE(c.name,''), ' ', 1)) >= 3
+       GROUP BY c.id, c.name, c.email, c.emails_sent, c.emails_received, c.relationship_score, c.last_interaction_at
+       HAVING COUNT(*) >= 2
+     )
+     SELECT DISTINCT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at FROM (
+       SELECT * FROM base
+       UNION ALL SELECT * FROM referenced_in_corrections
+       UNION ALL SELECT * FROM referenced_in_predictions
+       UNION ALL SELECT * FROM referenced_in_recent_obs
+     ) merged
+     ORDER BY relationship_score DESC`
   )
   const contacts = contactsRes.rows
+  console.log(`[relationships] Candidate pool: ${contacts.length} contacts (base + correction/prediction/obs refs)`)
 
   if (contacts.length === 0) {
     console.log('[relationships] No contacts to analyze')

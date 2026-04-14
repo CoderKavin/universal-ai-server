@@ -2481,6 +2481,155 @@ FORMATTING:
 
   // ── POST /api/import (bulk data migration from local SQLite) ──
 
+  // ── Admin endpoints for test data inspection and management ────
+
+  // Search contacts by name or email
+  app.get('/api/admin/contacts', async (req, res) => {
+    try {
+      const pool = getPool()
+      const search = ((req.query.search as string) || '').toLowerCase()
+      const rows = await pool.query(
+        `SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
+         FROM contacts WHERE LOWER(COALESCE(name,'')) LIKE $1 OR LOWER(email) LIKE $1
+         ORDER BY relationship_score DESC LIMIT 50`,
+        [`%${search}%`]
+      )
+      res.json({ contacts: rows.rows })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Search email threads
+  app.get('/api/admin/email-threads', async (req, res) => {
+    try {
+      const pool = getPool()
+      const search = ((req.query.search as string) || '').toLowerCase()
+      const rows = await pool.query(
+        `SELECT thread_id, subject, participants, last_message_from, last_message_date, stale_days, awaiting_reply, message_count
+         FROM email_threads
+         WHERE LOWER(COALESCE(participants,'')) LIKE $1 OR LOWER(COALESCE(subject,'')) LIKE $1 OR LOWER(COALESCE(last_message_from,'')) LIKE $1
+         ORDER BY last_message_date DESC LIMIT 30`,
+        [`%${search}%`]
+      )
+      res.json({ threads: rows.rows })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Search observations for a keyword in last N hours
+  app.get('/api/admin/obs-search', async (req, res) => {
+    try {
+      const pool = getPool()
+      const search = ((req.query.search as string) || '').toLowerCase()
+      const hours = parseInt((req.query.hours as string) || '24', 10)
+      const rows = await pool.query(
+        `SELECT id, timestamp, source, event_type, raw_content
+         FROM observations
+         WHERE LOWER(raw_content) LIKE $1
+         AND timestamp > NOW() - ($2 || ' hours')::interval
+         ORDER BY timestamp DESC LIMIT 50`,
+        [`%${search}%`, String(hours)]
+      )
+      res.json({ observations: rows.rows, count: rows.rows.length })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Seed synthetic test data (marked with test-overlay- id prefix)
+  app.post('/api/admin/seed-test-data', async (req, res) => {
+    try {
+      const pool = getPool()
+      const { calendarEvents, actionChains, corrections, contacts, observations } = req.body
+      const counts: Record<string, number> = {}
+
+      for (const c of contacts || []) {
+        await pool.query(
+          `INSERT INTO contacts (id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (email) DO UPDATE SET
+           name=$2, emails_sent=$4, emails_received=$5, relationship_score=$6, last_interaction_at=$7`,
+          [c.id, c.name, c.email, c.emails_sent || 0, c.emails_received || 0, c.relationship_score || 0, c.last_interaction_at || new Date().toISOString()]
+        )
+      }
+      counts.contacts = (contacts || []).length
+
+      for (const ev of calendarEvents || []) {
+        await pool.query(
+          `INSERT INTO calendar_events (id, summary, start_time, end_time, all_day, location, participants, recurring, status, calendar_name)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           ON CONFLICT (id) DO UPDATE SET summary=$2, start_time=$3, end_time=$4, participants=$7, status=$9`,
+          [ev.id, ev.summary, ev.start_time, ev.end_time, ev.all_day || 0, ev.location || '', ev.participants || '', ev.recurring || 0, ev.status || 'confirmed', ev.calendar_name || 'primary']
+        )
+      }
+      counts.calendar_events = (calendarEvents || []).length
+
+      for (const ac of actionChains || []) {
+        await pool.query(
+          `INSERT INTO action_chains (id, trigger_event, trigger_type, trigger_entity, status, context_snapshot)
+           VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET trigger_entity=$4, status=$5`,
+          [ac.id, ac.trigger_event, ac.trigger_type || 'test', ac.trigger_entity || '', ac.status || 'active', ac.context_snapshot || '']
+        )
+        for (const step of ac.steps || []) {
+          await pool.query(
+            `INSERT INTO chain_steps (id, chain_id, step_number, title, description, status)
+             VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET title=$4, description=$5, status=$6`,
+            [step.id, ac.id, step.step_number, step.title, step.description || '', step.status || 'pending']
+          )
+        }
+      }
+      counts.action_chains = (actionChains || []).length
+
+      for (const c of corrections || []) {
+        await pool.query(
+          `INSERT INTO correction_log (id, trigger_action, trigger_context, user_action, correction_text)
+           VALUES ($1,$2,$3,$4,$5) ON CONFLICT (id) DO UPDATE SET trigger_action=$2, trigger_context=$3, user_action=$4, correction_text=$5`,
+          [c.id, c.trigger_action, c.trigger_context || '', c.user_action, c.correction_text || '']
+        )
+      }
+      counts.corrections = (corrections || []).length
+
+      for (const o of observations || []) {
+        await pool.query(
+          `INSERT INTO observations (id, source, event_type, raw_content, extracted_entities, emotional_valence)
+           VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO NOTHING`,
+          [o.id, o.source, o.event_type, o.raw_content, o.extracted_entities || '{}', o.emotional_valence || 'neutral']
+        )
+      }
+      counts.observations = (observations || []).length
+
+      res.json({ ok: true, counts })
+    } catch (err: any) {
+      console.error('[admin/seed] Error:', err.message)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Delete all test data (id LIKE 'test-overlay-%')
+  app.post('/api/admin/delete-test-data', async (req, res) => {
+    try {
+      const pool = getPool()
+      const prefix = 'test-overlay-'
+      const results: Record<string, number> = {}
+      const ops: [string, string][] = [
+        ['calendar_events', `DELETE FROM calendar_events WHERE id LIKE $1`],
+        ['chain_steps',     `DELETE FROM chain_steps WHERE id LIKE $1 OR chain_id LIKE $1`],
+        ['action_chains',   `DELETE FROM action_chains WHERE id LIKE $1`],
+        ['correction_log',  `DELETE FROM correction_log WHERE id LIKE $1`],
+        ['observations',    `DELETE FROM observations WHERE id LIKE $1`],
+      ]
+      for (const [name, sql] of ops) {
+        const r = await pool.query(sql, [`${prefix}%`])
+        results[name] = r.rowCount || 0
+      }
+      res.json({ ok: true, deleted: results })
+    } catch (err: any) {
+      console.error('[admin/delete] Error:', err.message)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
   app.post('/api/import', async (req, res) => {
     try {
       const { contacts, email_threads, calendar_events, commitments, insights, living_profile } = req.body
