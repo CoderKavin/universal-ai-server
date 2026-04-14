@@ -1887,13 +1887,26 @@ FORMATTING:
       const firstName = (fullName: string): string =>
         (fullName || '').trim().split(/\s+/)[0].toLowerCase()
 
+      // Common words that look like names but aren't useful for contact matching
+      const NAME_STOPLIST = new Set([
+        'mail', 'gmail', 'inbox', 'compose', 'new', 'reply', 'sent', 'draft',
+        'team', 'admin', 'info', 'support', 'help', 'service', 'system',
+        'noreply', 'updates', 'news', 'alerts', 'today', 'weekly',
+        'play', 'apps', 'games', 'pinterest', 'instagram', 'google'
+      ])
+      const isUsefulName = (n: string): boolean =>
+        n.length >= 4 && !NAME_STOPLIST.has(n)
+
       // ── UPGRADE 1: Predictive pre-staging ──────────────────────
       // If compose state with no clear recipient yet, predict what they'll do.
       // Match against first name so short names work.
       const isBlankCompose = isCompose && signals.ocr.length < 100 &&
         !contacts.rows.some((c: any) => {
           const fn = firstName(c.name || '')
-          return fn.length >= 3 && allText.includes(fn)
+          if (!isUsefulName(fn)) return false
+          // Match with word boundary to avoid 'mail' matching inside 'gmail'
+          const re = new RegExp(`\\b${fn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`)
+          return re.test(allText)
         })
 
       if (isBlankCompose) {
@@ -1927,7 +1940,7 @@ FORMATTING:
       function entityConfidence(name: string, email?: string): number {
         const nameLower = (name || '').toLowerCase()
         const fn = firstName(name)
-        if (fn.length < 3) return 0
+        if (!isUsefulName(fn)) return 0
         const emailUser = (email || '').split('@')[0].toLowerCase()
 
         const contains = (hay: string): boolean => {
