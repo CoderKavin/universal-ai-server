@@ -2673,76 +2673,10 @@ FORMATTING:
 
   // ── Cartesia WebSocket streaming TTS ──────────────────────────
 
-  // Persistent WS connection to Cartesia for streaming TTS
-  let cartesiaWs: import('ws').WebSocket | null = null
-  let cartesiaWsReady = false
-  let cartesiaWsKey = ''
-  const cartesiaListeners = new Map<string, (msg: any) => void>()
-
-  function getCartesiaWs(cartesiaKey: string): Promise<import('ws').WebSocket> {
-    return new Promise((resolve, reject) => {
-      // Reuse if connected and key matches
-      if (cartesiaWs && cartesiaWsReady && cartesiaWsKey === cartesiaKey) {
-        resolve(cartesiaWs)
-        return
-      }
-
-      // Close stale connection
-      if (cartesiaWs) {
-        try { cartesiaWs.close() } catch {}
-        cartesiaWs = null
-        cartesiaWsReady = false
-      }
-
-      const WS = require('ws') as typeof import('ws')
-      const wsUrl = `wss://api.cartesia.ai/tts/websocket?api_key=${encodeURIComponent(cartesiaKey)}&cartesia_version=${CARTESIA_VERSION}`
-      const ws = new WS.WebSocket(wsUrl)
-      cartesiaWsKey = cartesiaKey
-
-      const timeout = setTimeout(() => {
-        ws.close()
-        reject(new Error('Cartesia WS connection timeout'))
-      }, 10000)
-
-      ws.on('open', () => {
-        clearTimeout(timeout)
-        cartesiaWs = ws
-        cartesiaWsReady = true
-        console.log('[TTS-WS] Cartesia WebSocket connected')
-        resolve(ws)
-      })
-
-      ws.on('message', (raw: Buffer) => {
-        try {
-          const msg = JSON.parse(raw.toString())
-          const contextId = msg.context_id
-          if (contextId && cartesiaListeners.has(contextId)) {
-            cartesiaListeners.get(contextId)!(msg)
-          }
-        } catch (err) {
-          console.error('[TTS-WS] Failed to parse Cartesia message:', err)
-        }
-      })
-
-      ws.on('close', () => {
-        console.log('[TTS-WS] Cartesia WebSocket closed')
-        cartesiaWs = null
-        cartesiaWsReady = false
-      })
-
-      ws.on('error', (err: Error) => {
-        clearTimeout(timeout)
-        console.error('[TTS-WS] Cartesia WebSocket error:', err.message)
-        cartesiaWs = null
-        cartesiaWsReady = false
-        reject(err)
-      })
-    })
-  }
-
   /**
    * Stream text chunks to Cartesia WS and forward audio to glasses in real-time.
-   * Returns a controller object with sendChunk() and finish() methods.
+   * Creates a fresh WS connection per call — simpler and more reliable than
+   * pooling. WS connection overhead is ~100ms, negligible compared to TTFB wins.
    */
   function createCartesiaStream(cartesiaKey: string, glassesWs: WebSocket): {
     sendChunk: (text: string) => void
@@ -2758,70 +2692,133 @@ FORMATTING:
     let resolveDone: (val: { audioBytes: number; chunks: number }) => void
     let wsInstance: import('ws').WebSocket | null = null
     let firstChunkSent = false
+    let finished = false
+    let doneReceived = false
 
     const readyPromise = new Promise<void>((res, rej) => { resolveReady = res; rejectReady = rej })
     const donePromise = new Promise<{ audioBytes: number; chunks: number }>((res) => { resolveDone = res })
 
-    // Set up listener for this context
-    cartesiaListeners.set(contextId, (msg: any) => {
-      if (msg.type === 'chunk' && msg.data) {
-        const pcm = Buffer.from(msg.data, 'base64')
-        audioBytes += pcm.length
-        audioChunks++
-        // Forward to glasses immediately
-        sendTTSFrame(glassesWs, pcm)
-      } else if (msg.type === 'done') {
-        cartesiaListeners.delete(contextId)
-        resolveDone({ audioBytes, chunks: audioChunks })
-      } else if (msg.type === 'error') {
-        console.error(`[TTS-WS] Cartesia stream error (${contextId}):`, msg.error)
-        cartesiaListeners.delete(contextId)
-        resolveDone({ audioBytes, chunks: audioChunks })
+    const completeDone = () => {
+      if (finished) return
+      finished = true
+      if (wsInstance) {
+        try { wsInstance.close() } catch {}
+      }
+      resolveDone({ audioBytes, chunks: audioChunks })
+    }
+
+    // Connect fresh WS for this stream
+    const WS = require('ws') as typeof import('ws')
+    const wsUrl = `wss://api.cartesia.ai/tts/websocket?api_key=${encodeURIComponent(cartesiaKey)}&cartesia_version=${CARTESIA_VERSION}`
+    const ws = new WS.WebSocket(wsUrl)
+
+    const connectTimeout = setTimeout(() => {
+      console.error(`[TTS-WS] Connection timeout (${contextId})`)
+      try { ws.close() } catch {}
+      rejectReady!(new Error('Cartesia WS connection timeout'))
+      completeDone()
+    }, 10000)
+
+    ws.on('open', () => {
+      clearTimeout(connectTimeout)
+      wsInstance = ws
+      console.log(`[TTS-WS] Cartesia WS connected (${contextId})`)
+      resolveReady!()
+    })
+
+    ws.on('message', (raw: Buffer) => {
+      try {
+        const msg = JSON.parse(raw.toString())
+        if (msg.context_id && msg.context_id !== contextId) return
+
+        if (msg.type === 'chunk' && msg.data) {
+          const pcm = Buffer.from(msg.data, 'base64')
+          audioBytes += pcm.length
+          audioChunks++
+          if (glassesWs.readyState === 1 /* OPEN */) {
+            sendTTSFrame(glassesWs, pcm)
+          }
+        } else if (msg.type === 'done') {
+          doneReceived = true
+          completeDone()
+        } else if (msg.type === 'error') {
+          console.error(`[TTS-WS] Cartesia stream error (${contextId}):`, msg.error)
+          completeDone()
+        }
+      } catch (err) {
+        console.error(`[TTS-WS] Parse error (${contextId}):`, err)
       }
     })
 
-    // Connect asynchronously
-    getCartesiaWs(cartesiaKey).then(ws => {
-      wsInstance = ws
-      resolveReady!()
-    }).catch(err => {
-      console.error('[TTS-WS] Failed to connect for streaming:', err.message)
-      cartesiaListeners.delete(contextId)
+    ws.on('close', () => {
+      console.log(`[TTS-WS] WS closed (${contextId}) audio=${audioBytes}b chunks=${audioChunks} done=${doneReceived}`)
+      completeDone()
+    })
+
+    ws.on('error', (err: Error) => {
+      clearTimeout(connectTimeout)
+      console.error(`[TTS-WS] WS error (${contextId}):`, err.message)
       rejectReady!(err)
+      completeDone()
     })
 
     return {
       contextId,
       ready: readyPromise,
       sendChunk(text: string) {
-        if (!wsInstance || !text.trim()) return
-        wsInstance.send(JSON.stringify({
-          model_id: CARTESIA_MODEL,
-          transcript: text,
-          voice: { mode: 'id', id: CARTESIA_VOICE_ID },
-          output_format: CARTESIA_OUTPUT_FORMAT,
-          context_id: contextId,
-          continue: true,
-          language: 'en'
-        }))
-        if (!firstChunkSent) {
-          firstChunkSent = true
-          console.log(`[TTS-WS] First text chunk sent to Cartesia (${contextId})`)
+        if (!wsInstance || !text.trim() || finished) return
+        if (wsInstance.readyState !== 1 /* OPEN */) return
+        try {
+          wsInstance.send(JSON.stringify({
+            model_id: CARTESIA_MODEL,
+            transcript: text,
+            voice: { mode: 'id', id: CARTESIA_VOICE_ID },
+            output_format: CARTESIA_OUTPUT_FORMAT,
+            context_id: contextId,
+            continue: true,
+            language: 'en'
+          }))
+          if (!firstChunkSent) {
+            firstChunkSent = true
+            console.log(`[TTS-WS] First text chunk sent (${contextId})`)
+          }
+        } catch (err: any) {
+          console.error(`[TTS-WS] sendChunk error (${contextId}):`, err.message)
         }
       },
       async finish(): Promise<{ audioBytes: number; chunks: number }> {
-        if (!wsInstance) return { audioBytes: 0, chunks: 0 }
-        // Send empty transcript with continue=false to signal end
-        wsInstance.send(JSON.stringify({
-          model_id: CARTESIA_MODEL,
-          transcript: '',
-          voice: { mode: 'id', id: CARTESIA_VOICE_ID },
-          output_format: CARTESIA_OUTPUT_FORMAT,
-          context_id: contextId,
-          continue: false,
-          language: 'en'
-        }))
-        return donePromise
+        if (finished) return { audioBytes, chunks: audioChunks }
+        if (wsInstance && wsInstance.readyState === 1 /* OPEN */) {
+          try {
+            wsInstance.send(JSON.stringify({
+              model_id: CARTESIA_MODEL,
+              transcript: '',
+              voice: { mode: 'id', id: CARTESIA_VOICE_ID },
+              output_format: CARTESIA_OUTPUT_FORMAT,
+              context_id: contextId,
+              continue: false,
+              language: 'en'
+            }))
+          } catch (err: any) {
+            console.error(`[TTS-WS] finish send error (${contextId}):`, err.message)
+            completeDone()
+          }
+        }
+
+        // Hard timeout: don't wait forever for done signal
+        const timeoutMs = 20000
+        return Promise.race([
+          donePromise,
+          new Promise<{ audioBytes: number; chunks: number }>((res) => {
+            setTimeout(() => {
+              if (!finished) {
+                console.warn(`[TTS-WS] finish timeout (${contextId}) — forcing close after ${timeoutMs}ms`)
+                completeDone()
+              }
+              res({ audioBytes, chunks: audioChunks })
+            }, timeoutMs)
+          })
+        ])
       }
     }
   }
