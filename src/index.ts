@@ -2558,6 +2558,16 @@ FORMATTING:
     }
   })
 
+  app.delete('/api/devices/:device_id', async (req, res) => {
+    try {
+      const pool = getPool()
+      const r = await pool.query(`DELETE FROM devices WHERE device_id = $1`, [req.params.device_id])
+      res.json({ ok: true, deleted: r.rowCount })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
   app.patch('/api/devices/:device_id/heartbeat', async (req, res) => {
     try {
       const pool = getPool()
