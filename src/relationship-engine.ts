@@ -67,66 +67,104 @@ export async function runRelationshipEngine(): Promise<number> {
 
   // ── 1. Load all contacts ────────────────────────────────────────
 
-  // Base pool: top 100 contacts by relationship_score (bidirectional, non-promotional)
-  const NOT_PROMO = `
-    email NOT LIKE '%noreply%' AND email NOT LIKE '%no-reply%'
-    AND email NOT LIKE '%notifications%' AND email NOT LIKE '%newsletter%'
-    AND email NOT LIKE '%updates%' AND email NOT LIKE '%marketing%'
-    AND email NOT LIKE '%promo%' AND email NOT LIKE '%alerts%'
-    AND email NOT LIKE '%digest%' AND email NOT LIKE '%discover%'
-    AND email NOT LIKE '%campaigns%' AND email NOT LIKE '%@e.%'
-    AND email NOT LIKE '%@mail.%' AND email NOT LIKE '%@learn.%'
-  `
-
+  // Base pool: top 100 contacts by relationship_score
   const contactsRes = await pool.query(
-    `WITH base AS (
-       SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
-       FROM contacts WHERE name IS NOT NULL AND ${NOT_PROMO} AND emails_sent > 0
-       ORDER BY relationship_score DESC LIMIT 100
-     ),
-     referenced_in_corrections AS (
-       SELECT DISTINCT c.id, c.name, c.email, c.emails_sent, c.emails_received, c.relationship_score, c.last_interaction_at
-       FROM contacts c
-       JOIN correction_log cl ON (
-         LOWER(cl.trigger_context) LIKE LOWER('%' || SPLIT_PART(COALESCE(c.name,''), ' ', 1) || '%')
-         OR LOWER(cl.trigger_action) LIKE LOWER('%' || SPLIT_PART(COALESCE(c.name,''), ' ', 1) || '%')
-       )
-       WHERE c.name IS NOT NULL AND ${NOT_PROMO}
-         AND cl.timestamp > NOW() - INTERVAL '90 days'
-         AND LENGTH(SPLIT_PART(COALESCE(c.name,''), ' ', 1)) >= 3
-     ),
-     referenced_in_predictions AS (
-       SELECT DISTINCT c.id, c.name, c.email, c.emails_sent, c.emails_received, c.relationship_score, c.last_interaction_at
-       FROM contacts c
-       JOIN predicted_actions pa ON (
-         LOWER(COALESCE(pa.description,'')) LIKE LOWER('%' || SPLIT_PART(COALESCE(c.name,''), ' ', 1) || '%')
-         OR LOWER(COALESCE(pa.title,'')) LIKE LOWER('%' || SPLIT_PART(COALESCE(c.name,''), ' ', 1) || '%')
-         OR LOWER(COALESCE(pa.related_entity,'')) LIKE LOWER('%' || SPLIT_PART(COALESCE(c.name,''), ' ', 1) || '%')
-       )
-       WHERE c.name IS NOT NULL AND ${NOT_PROMO}
-         AND pa.status = 'pending'
-         AND LENGTH(SPLIT_PART(COALESCE(c.name,''), ' ', 1)) >= 3
-     ),
-     referenced_in_recent_obs AS (
-       SELECT DISTINCT c.id, c.name, c.email, c.emails_sent, c.emails_received, c.relationship_score, c.last_interaction_at
-       FROM contacts c
-       JOIN observations o ON LOWER(o.raw_content) LIKE LOWER('%' || SPLIT_PART(COALESCE(c.name,''), ' ', 1) || '%')
-       WHERE c.name IS NOT NULL AND ${NOT_PROMO}
-         AND o.timestamp > NOW() - INTERVAL '7 days'
-         AND LENGTH(SPLIT_PART(COALESCE(c.name,''), ' ', 1)) >= 3
-       GROUP BY c.id, c.name, c.email, c.emails_sent, c.emails_received, c.relationship_score, c.last_interaction_at
-       HAVING COUNT(*) >= 2
-     )
-     SELECT DISTINCT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at FROM (
-       SELECT * FROM base
-       UNION ALL SELECT * FROM referenced_in_corrections
-       UNION ALL SELECT * FROM referenced_in_predictions
-       UNION ALL SELECT * FROM referenced_in_recent_obs
-     ) merged
-     ORDER BY relationship_score DESC`
+    `SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
+     FROM contacts WHERE name IS NOT NULL
+     AND email NOT LIKE '%noreply%' AND email NOT LIKE '%no-reply%'
+     AND email NOT LIKE '%notifications%' AND email NOT LIKE '%newsletter%'
+     AND email NOT LIKE '%updates%' AND email NOT LIKE '%marketing%'
+     AND email NOT LIKE '%promo%' AND email NOT LIKE '%alerts%'
+     AND email NOT LIKE '%digest%' AND email NOT LIKE '%discover%'
+     AND email NOT LIKE '%campaigns%' AND email NOT LIKE '%@e.%'
+     AND email NOT LIKE '%@mail.%' AND email NOT LIKE '%@learn.%'
+     AND emails_sent > 0
+     ORDER BY relationship_score DESC LIMIT 100`
   )
-  const contacts = contactsRes.rows
-  console.log(`[relationships] Candidate pool: ${contacts.length} contacts (base + correction/prediction/obs refs)`)
+  const contactsMap = new Map<string, any>()
+  for (const c of contactsRes.rows) contactsMap.set(c.id, c)
+
+  // ── Inclusion expansion: pull in contacts referenced by active brain state ──
+  // We do this in JS instead of SQL to avoid cross-table cartesian product cost.
+
+  async function addContactsFromQuery(sql: string, args: any[], reason: string): Promise<void> {
+    const rows = await pool.query(sql, args)
+    const before = contactsMap.size
+    for (const extra of rows.rows) {
+      if (!contactsMap.has(extra.id)) contactsMap.set(extra.id, extra)
+    }
+    const added = contactsMap.size - before
+    if (added > 0) console.log(`[relationships] +${added} contacts via ${reason}`)
+  }
+
+  // 1a. Contacts referenced in correction_log (last 90 days)
+  //     Strategy: fetch corrections, extract first-word tokens from trigger_action/trigger_context,
+  //     then lookup matching contacts by first-name.
+  const cLogRows = await pool.query(
+    `SELECT trigger_action, trigger_context FROM correction_log
+     WHERE timestamp > NOW() - INTERVAL '90 days' LIMIT 500`
+  )
+  const tokenSet = new Set<string>()
+  for (const row of cLogRows.rows) {
+    const text = `${row.trigger_action || ''} ${row.trigger_context || ''}`.toLowerCase()
+    // Look for typical name-like tokens (3-20 chars, no numbers)
+    const matches = text.match(/\b[a-z][a-z'.-]{2,19}\b/g) || []
+    for (const t of matches) tokenSet.add(t)
+  }
+  if (tokenSet.size > 0) {
+    const tokens = Array.from(tokenSet).slice(0, 200) // cap to avoid oversize IN clause
+    await addContactsFromQuery(
+      `SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
+       FROM contacts WHERE name IS NOT NULL AND LOWER(SPLIT_PART(name, ' ', 1)) = ANY($1::text[])`,
+      [tokens],
+      'correction_log'
+    )
+  }
+
+  // 1b. Contacts referenced by pending predicted_actions
+  const paRows = await pool.query(
+    `SELECT title, description, related_entity FROM predicted_actions
+     WHERE status = 'pending' LIMIT 200`
+  )
+  const paTokens = new Set<string>()
+  for (const row of paRows.rows) {
+    const text = `${row.title || ''} ${row.description || ''} ${row.related_entity || ''}`.toLowerCase()
+    const matches = text.match(/\b[a-z][a-z'.-]{2,19}\b/g) || []
+    for (const t of matches) paTokens.add(t)
+  }
+  if (paTokens.size > 0) {
+    const tokens = Array.from(paTokens).slice(0, 300)
+    await addContactsFromQuery(
+      `SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
+       FROM contacts WHERE name IS NOT NULL AND LOWER(SPLIT_PART(name, ' ', 1)) = ANY($1::text[])`,
+      [tokens],
+      'predicted_actions'
+    )
+  }
+
+  // 1c. Contacts mentioned 2+ times in recent observations (last 7 days)
+  const obsRows = await pool.query(
+    `SELECT raw_content FROM observations
+     WHERE timestamp > NOW() - INTERVAL '7 days' LIMIT 2000`
+  )
+  const obsCounts = new Map<string, number>()
+  for (const row of obsRows.rows) {
+    const text = (row.raw_content || '').toLowerCase()
+    const matches = text.match(/\b[a-z][a-z'.-]{2,19}\b/g) || []
+    for (const t of matches) obsCounts.set(t, (obsCounts.get(t) || 0) + 1)
+  }
+  const obsTokens = Array.from(obsCounts.entries()).filter(([_, n]) => n >= 2).map(([t]) => t).slice(0, 300)
+  if (obsTokens.length > 0) {
+    await addContactsFromQuery(
+      `SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
+       FROM contacts WHERE name IS NOT NULL AND LOWER(SPLIT_PART(name, ' ', 1)) = ANY($1::text[])`,
+      [obsTokens],
+      'observations'
+    )
+  }
+
+  const contacts = Array.from(contactsMap.values())
+  console.log(`[relationships] Candidate pool: ${contacts.length} contacts (base 100 + extras)`)
 
   if (contacts.length === 0) {
     console.log('[relationships] No contacts to analyze')
