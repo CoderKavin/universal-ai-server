@@ -1853,16 +1853,26 @@ FORMATTING:
       const insights: any[] = []
 
       // Load contacts once (shared across matchers)
+      // Threshold lowered to 5 so recently-surfaced contacts (e.g., Rajeev at closeness=15)
+      // who have active corrections/predictions/observations aren't excluded.
       const contacts = await pool.query(
         `SELECT name, email, current_closeness, trajectory, anomaly, last_interaction,
                 interaction_freq_30d, whatsapp_msgs_30d, email_count_30d
-         FROM relationships WHERE current_closeness > 15 ORDER BY current_closeness DESC LIMIT 20`
+         FROM relationships WHERE current_closeness > 5 ORDER BY current_closeness DESC LIMIT 30`
       )
 
+      // Helper: extract first name for matching (handles "Rajeev kumar t k" → "rajeev")
+      const firstName = (fullName: string): string =>
+        (fullName || '').trim().split(/\s+/)[0].toLowerCase()
+
       // ── UPGRADE 1: Predictive pre-staging ──────────────────────
-      // If compose state with no clear recipient yet, predict what they'll do
+      // If compose state with no clear recipient yet, predict what they'll do.
+      // Match against first name so short names work.
       const isBlankCompose = isCompose && signals.ocr.length < 100 &&
-        !contacts.rows.some((c: any) => allText.includes((c.name || '').toLowerCase()))
+        !contacts.rows.some((c: any) => {
+          const fn = firstName(c.name || '')
+          return fn.length >= 3 && allText.includes(fn)
+        })
 
       if (isBlankCompose) {
         // Find the most likely next action based on stale threads + pending actions
@@ -1890,21 +1900,32 @@ FORMATTING:
       }
 
       // ── Multi-signal entity matching function ──────────────────
-      // UPGRADE 8: requires match in 2+ signals for high confidence
-      function entityConfidence(name: string): number {
-        const nameLower = name.toLowerCase()
-        if (nameLower.length < 3) return 0
+      // UPGRADE 8: requires match in 2+ signals for high confidence.
+      // Matches on full name OR first name (handles "Rajeev kumar t k" → "rajeev").
+      function entityConfidence(name: string, email?: string): number {
+        const nameLower = (name || '').toLowerCase()
+        const fn = firstName(name)
+        if (fn.length < 3) return 0
+        const emailUser = (email || '').split('@')[0].toLowerCase()
+
+        const contains = (hay: string): boolean => {
+          if (!hay) return false
+          if (nameLower.length >= 3 && hay.includes(nameLower)) return true
+          if (fn.length >= 3 && new RegExp(`\\b${fn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(hay)) return true
+          if (emailUser.length >= 3 && hay.includes(emailUser)) return true
+          return false
+        }
+
         let hits = 0
-        if (signals.ocr.includes(nameLower)) hits++
-        if (signals.title.includes(nameLower)) hits++
-        if (signals.url.includes(nameLower.replace(/\s/g, ''))) hits++
-        // Boost for multi-signal agreement
+        if (contains(signals.ocr)) hits++
+        if (contains(signals.title)) hits++
+        if (contains(signals.url.replace(/\s/g, ''))) hits++
         return hits === 0 ? 0 : hits >= 2 ? 90 : 70
       }
 
       // ── Matcher 1: Contact name → actionable pending items ──
       for (const c of contacts.rows) {
-        const conf = entityConfidence(c.name || '')
+        const conf = entityConfidence(c.name || '', c.email)
         if (conf === 0) continue
 
         const pendingAction = await pool.query(
@@ -1968,7 +1989,7 @@ FORMATTING:
       // ── Matcher 3: Email compose with recipient ──
       if (isCompose && !isBlankCompose) {
         for (const c of contacts.rows) {
-          const conf = entityConfidence(c.name || '')
+          const conf = entityConfidence(c.name || '', c.email)
           if (conf === 0) continue
 
           const commitment = await pool.query(
