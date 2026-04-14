@@ -2636,7 +2636,7 @@ FORMATTING:
 
   // ── Glasses helpers: Cartesia TTS (REST fallback + WebSocket streaming) ──
 
-  const CARTESIA_VOICE_ID = '4f7f1324-1853-48a6-b294-4e78e8036a83'
+  const CARTESIA_VOICE_ID = '1463a4e1-56a1-4b41-b257-728d56e93605'
   const CARTESIA_MODEL = 'sonic-2'
   const CARTESIA_VERSION = '2024-06-10'
   const CARTESIA_OUTPUT_FORMAT = { container: 'raw' as const, sample_rate: 16000, encoding: 'pcm_s16le' as const }
