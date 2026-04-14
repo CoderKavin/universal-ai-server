@@ -2107,32 +2107,49 @@ FORMATTING:
       if (mode === 'proactive' || insights.length === 0) {
         const recentActivity = await pool.query(
           `SELECT source, event_type, raw_content FROM observations
-           WHERE timestamp > NOW() - INTERVAL '10 minutes'
-           ORDER BY timestamp DESC LIMIT 15`
+           WHERE timestamp > NOW() - INTERVAL '15 minutes'
+           ORDER BY timestamp DESC LIMIT 30`
         )
         if (recentActivity.rows.length >= 3) {
-          // Look for focused topic across recent activity
           const activityText = recentActivity.rows.map((r: any) => r.raw_content || '').join(' ').toLowerCase()
-          // Find topics that appear in 3+ recent observations
-          const topicCandidates = contacts.rows.filter((c: any) =>
-            (c.name || '').length > 3 && activityText.split(c.name.toLowerCase()).length > 2
-          )
-          for (const topic of topicCandidates) {
-            const pa = await pool.query(
-              `SELECT title, trigger_context FROM predicted_actions
-               WHERE status = 'pending' AND expires_at > NOW()
-               AND (title ILIKE $1 OR related_entity ILIKE $2) LIMIT 1`,
-              [`%${topic.name}%`, `%${topic.email}%`]
+          // Extract candidate name tokens from recent activity and find matching contacts
+          const tokens = new Set<string>()
+          for (const w of activityText.split(/[^a-z]+/)) {
+            if (w.length >= 3 && w.length <= 20) tokens.add(w)
+          }
+          // Only keep tokens appearing 3+ times (with word boundary)
+          const focusedTokens: string[] = []
+          for (const t of tokens) {
+            const re = new RegExp(`\\b${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g')
+            const hits = (activityText.match(re) || []).length
+            if (hits >= 3) focusedTokens.push(t)
+          }
+          if (focusedTokens.length > 0) {
+            const focusedContacts = await pool.query(
+              `SELECT name, email FROM relationships
+               WHERE current_closeness > 5
+               AND LOWER(SPLIT_PART(name, ' ', 1)) = ANY($1::text[])
+               LIMIT 5`,
+              [focusedTokens]
             )
-            if (pa.rows.length > 0) {
-              insights.push({
-                type: 'sequence', label: 'PATTERN',
-                title: `You're focused on ${topic.name}`,
-                body: (pa.rows[0].trigger_context || pa.rows[0].title || '').slice(0, 60),
-                confidence: 72, entity_id: topic.email,
-                upgrade: 'sequence'
-              })
-              break
+            for (const topic of focusedContacts.rows) {
+              const fn = firstName(topic.name)
+              const pa = await pool.query(
+                `SELECT title, trigger_context FROM predicted_actions
+                 WHERE status = 'pending' AND expires_at > NOW()
+                 AND (title ILIKE $1 OR related_entity ILIKE $2 OR description ILIKE $1 OR trigger_context ILIKE $1) LIMIT 1`,
+                [`%${fn}%`, `%${topic.email}%`]
+              )
+              if (pa.rows.length > 0) {
+                insights.push({
+                  type: 'sequence', label: 'PATTERN',
+                  title: `You're focused on ${topic.name}`,
+                  body: (pa.rows[0].trigger_context || pa.rows[0].title || '').slice(0, 60),
+                  confidence: 72, entity_id: topic.email,
+                  upgrade: 'sequence'
+                })
+                break
+              }
             }
           }
         }
