@@ -1852,14 +1852,30 @@ FORMATTING:
 
       const insights: any[] = []
 
-      // Load contacts once (shared across matchers)
-      // Threshold lowered to 5 so recently-surfaced contacts (e.g., Rajeev at closeness=15)
-      // who have active corrections/predictions/observations aren't excluded.
-      const contacts = await pool.query(
-        `SELECT name, email, current_closeness, trajectory, anomaly, last_interaction,
-                interaction_freq_30d, whatsapp_msgs_30d, email_count_30d
-         FROM relationships WHERE current_closeness > 5 ORDER BY current_closeness DESC LIMIT 30`
-      )
+      // Load contacts once (shared across matchers).
+      // Use signal-aware filter: if any name in signals, pull that specific contact;
+      // otherwise fall back to top-50 by closeness.
+      const signalNames = new Set<string>()
+      const nameWords = allText.match(/\b[a-z][a-z'.-]{2,19}\b/g) || []
+      for (const w of nameWords) signalNames.add(w)
+
+      const contacts = signalNames.size > 0
+        ? await pool.query(
+            `SELECT name, email, current_closeness, trajectory, anomaly, last_interaction,
+                    interaction_freq_30d, whatsapp_msgs_30d, email_count_30d
+             FROM relationships
+             WHERE current_closeness > 5
+             AND (LOWER(SPLIT_PART(name, ' ', 1)) = ANY($1::text[])
+                  OR LOWER(SPLIT_PART(email, '@', 1)) = ANY($1::text[])
+                  OR current_closeness >= 20)
+             ORDER BY current_closeness DESC LIMIT 50`,
+            [Array.from(signalNames)]
+          )
+        : await pool.query(
+            `SELECT name, email, current_closeness, trajectory, anomaly, last_interaction,
+                    interaction_freq_30d, whatsapp_msgs_30d, email_count_30d
+             FROM relationships WHERE current_closeness > 5 ORDER BY current_closeness DESC LIMIT 30`
+          )
 
       // Helper: extract first name for matching (handles "Rajeev kumar t k" → "rajeev")
       const firstName = (fullName: string): string =>
