@@ -170,15 +170,31 @@ async function upsertWhatsAppContact(info: {
       )
       return { action: 'updated' }
     }
-    // New phone-only contact
+    // New phone-only contact. No ON CONFLICT: partial unique index does not
+    // satisfy ON CONFLICT inference; the SELECT above already guarantees no
+    // row with this phone exists.
     const id = crypto.randomUUID()
     const tsText = typeof info.latestTs === 'string' ? info.latestTs : new Date(info.latestTs).toISOString()
-    await pool.query(
-      `INSERT INTO contacts (id, name, phone, primary_channel, whatsapp_msgs_total, last_whatsapp_at, last_interaction_at, needs_manual_merge)
-       VALUES ($1, $2, $3, 'whatsapp', $4::int, $5::timestamptz, $6::text, TRUE)
-       ON CONFLICT (phone) DO NOTHING`,
-      [id, `Unknown (${info.phone})`, info.phone, info.msgs, tsText, tsText]
-    )
+    try {
+      await pool.query(
+        `INSERT INTO contacts (id, name, phone, primary_channel, whatsapp_msgs_total, last_whatsapp_at, last_interaction_at, needs_manual_merge)
+         VALUES ($1, $2, $3, 'whatsapp', $4::int, $5::timestamptz, $6::text, TRUE)`,
+        [id, `Unknown (${info.phone})`, info.phone, info.msgs, tsText, tsText]
+      )
+    } catch (err: any) {
+      // Race — someone else inserted this phone in between; fall back to update
+      if (err.code === '23505') {
+        await pool.query(
+          `UPDATE contacts
+           SET whatsapp_msgs_total = COALESCE(whatsapp_msgs_total, 0) + $1::int,
+               last_whatsapp_at = GREATEST(COALESCE(last_whatsapp_at, $2::timestamptz), $2::timestamptz)
+           WHERE phone = $3`,
+          [info.msgs, tsText, info.phone]
+        )
+        return { action: 'updated' }
+      }
+      throw err
+    }
     return { action: 'created' }
   }
 
