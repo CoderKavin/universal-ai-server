@@ -222,7 +222,39 @@ export async function migrate(): Promise<void> {
       CREATE INDEX IF NOT EXISTS idx_calendar_start ON calendar_events(start_time);
       CREATE INDEX IF NOT EXISTS idx_centrum_snap_ts ON centrum_snapshots(timestamp DESC);
     `)
-    console.log('[db] PostgreSQL tables ready')
+
+    // ── Migration: contacts table for WhatsApp-only contacts ────
+    // Drop NOT NULL on email, add phone/primary_channel/whatsapp_display_name.
+    // Idempotent: safe to run on each startup.
+    await client.query(`
+      ALTER TABLE contacts ALTER COLUMN email DROP NOT NULL;
+      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS phone TEXT;
+      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS primary_channel TEXT DEFAULT 'email';
+      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS whatsapp_display_name TEXT;
+      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS whatsapp_msgs_total INT DEFAULT 0;
+      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS last_whatsapp_at TIMESTAMPTZ;
+      ALTER TABLE contacts ADD COLUMN IF NOT EXISTS needs_manual_merge BOOLEAN DEFAULT FALSE;
+    `)
+
+    // Existing email UNIQUE constraint still holds only for non-null emails?
+    // Postgres default unique allows multiple NULLs, so we're fine.
+    // Add a partial unique index on phone where phone IS NOT NULL.
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_phone_unique
+        ON contacts (phone) WHERE phone IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_contacts_primary_channel
+        ON contacts (primary_channel);
+    `)
+
+    // ── Migration: parsed_whatsapp JSONB column on observations ──
+    await client.query(`
+      ALTER TABLE observations ADD COLUMN IF NOT EXISTS parsed_whatsapp JSONB;
+      CREATE INDEX IF NOT EXISTS idx_obs_wa_unparsed
+        ON observations (id)
+        WHERE source = 'whatsapp' AND parsed_whatsapp IS NULL;
+    `)
+
+    console.log('[db] PostgreSQL tables ready (migrations applied)')
   } finally {
     client.release()
   }

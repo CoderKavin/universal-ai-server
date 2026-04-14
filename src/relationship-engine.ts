@@ -67,19 +67,30 @@ export async function runRelationshipEngine(): Promise<number> {
 
   // ── 1. Load all contacts ────────────────────────────────────────
 
-  // Base pool: top 100 contacts by relationship_score
+  // Base pool: top 100 contacts by relationship_score.
+  // Now includes WhatsApp-only contacts (email may be NULL); filter out
+  // promo senders ONLY when email is set (WhatsApp contacts always pass).
   const contactsRes = await pool.query(
-    `SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
+    `SELECT id, name, email, phone, primary_channel, whatsapp_display_name,
+            emails_sent, emails_received, relationship_score, last_interaction_at,
+            whatsapp_msgs_total, last_whatsapp_at
      FROM contacts WHERE name IS NOT NULL
-     AND email NOT LIKE '%noreply%' AND email NOT LIKE '%no-reply%'
-     AND email NOT LIKE '%notifications%' AND email NOT LIKE '%newsletter%'
-     AND email NOT LIKE '%updates%' AND email NOT LIKE '%marketing%'
-     AND email NOT LIKE '%promo%' AND email NOT LIKE '%alerts%'
-     AND email NOT LIKE '%digest%' AND email NOT LIKE '%discover%'
-     AND email NOT LIKE '%campaigns%' AND email NOT LIKE '%@e.%'
-     AND email NOT LIKE '%@mail.%' AND email NOT LIKE '%@learn.%'
-     AND emails_sent > 0
-     ORDER BY relationship_score DESC LIMIT 100`
+     AND (
+       email IS NULL
+       OR (
+         email NOT LIKE '%noreply%' AND email NOT LIKE '%no-reply%'
+         AND email NOT LIKE '%notifications%' AND email NOT LIKE '%newsletter%'
+         AND email NOT LIKE '%updates%' AND email NOT LIKE '%marketing%'
+         AND email NOT LIKE '%promo%' AND email NOT LIKE '%alerts%'
+         AND email NOT LIKE '%digest%' AND email NOT LIKE '%discover%'
+         AND email NOT LIKE '%campaigns%' AND email NOT LIKE '%@e.%'
+         AND email NOT LIKE '%@mail.%' AND email NOT LIKE '%@learn.%'
+         AND emails_sent > 0
+       )
+     )
+     ORDER BY
+       (COALESCE(relationship_score, 0) + COALESCE(whatsapp_msgs_total, 0) * 0.01) DESC
+     LIMIT 150`
   )
   const contactsMap = new Map<string, any>()
   for (const c of contactsRes.rows) contactsMap.set(c.id, c)
@@ -114,7 +125,9 @@ export async function runRelationshipEngine(): Promise<number> {
   if (tokenSet.size > 0) {
     const tokens = Array.from(tokenSet).slice(0, 200) // cap to avoid oversize IN clause
     await addContactsFromQuery(
-      `SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
+      `SELECT id, name, email, phone, primary_channel, whatsapp_display_name,
+              emails_sent, emails_received, relationship_score, last_interaction_at,
+              whatsapp_msgs_total, last_whatsapp_at
        FROM contacts WHERE name IS NOT NULL AND LOWER(SPLIT_PART(name, ' ', 1)) = ANY($1::text[])`,
       [tokens],
       'correction_log'
@@ -135,7 +148,9 @@ export async function runRelationshipEngine(): Promise<number> {
   if (paTokens.size > 0) {
     const tokens = Array.from(paTokens).slice(0, 300)
     await addContactsFromQuery(
-      `SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
+      `SELECT id, name, email, phone, primary_channel, whatsapp_display_name,
+              emails_sent, emails_received, relationship_score, last_interaction_at,
+              whatsapp_msgs_total, last_whatsapp_at
        FROM contacts WHERE name IS NOT NULL AND LOWER(SPLIT_PART(name, ' ', 1)) = ANY($1::text[])`,
       [tokens],
       'predicted_actions'
@@ -156,7 +171,9 @@ export async function runRelationshipEngine(): Promise<number> {
   const obsTokens = Array.from(obsCounts.entries()).filter(([_, n]) => n >= 2).map(([t]) => t).slice(0, 300)
   if (obsTokens.length > 0) {
     await addContactsFromQuery(
-      `SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
+      `SELECT id, name, email, phone, primary_channel, whatsapp_display_name,
+              emails_sent, emails_received, relationship_score, last_interaction_at,
+              whatsapp_msgs_total, last_whatsapp_at
        FROM contacts WHERE name IS NOT NULL AND LOWER(SPLIT_PART(name, ' ', 1)) = ANY($1::text[])`,
       [obsTokens],
       'observations'
@@ -176,20 +193,51 @@ export async function runRelationshipEngine(): Promise<number> {
   const enriched: ContactData[] = []
 
   for (const c of contacts) {
-    // WhatsApp message count (last 30 days)
-    const waRes = await pool.query(
-      `SELECT COUNT(*)::int as c FROM observations
-       WHERE source = 'whatsapp' AND timestamp >= $1
-       AND (raw_content ILIKE $2 OR raw_content ILIKE $3)`,
-      [day30ago, `%${c.name}%`, `%${c.email?.split('@')[0]}%`]
-    )
+    // WhatsApp message count (last 30 days).
+    // Prefer the structured whatsapp_msgs_total when available, fall back to
+    // name/email_prefix ILIKE scan over observations for legacy data.
+    let waCount = 0
+    if ((c.whatsapp_msgs_total || 0) > 0) {
+      // Use structured count, time-clipped via parsed observations
+      const waStruct = await pool.query(
+        `SELECT COUNT(*)::int as c FROM observations
+         WHERE source = 'whatsapp' AND timestamp >= $1
+         AND parsed_whatsapp IS NOT NULL
+         AND (
+           LOWER(parsed_whatsapp->>'display_name') = LOWER($2)
+           OR parsed_whatsapp->>'phone' = $3
+         )`,
+        [day30ago, c.whatsapp_display_name || c.name, c.phone || '']
+      )
+      waCount = waStruct.rows[0]?.c || c.whatsapp_msgs_total || 0
+    } else {
+      // Legacy: name/email ILIKE on raw_content
+      const waRes = await pool.query(
+        `SELECT COUNT(*)::int as c FROM observations
+         WHERE source = 'whatsapp' AND timestamp >= $1
+         AND (raw_content ILIKE $2 OR raw_content ILIKE $3)`,
+        [day30ago, `%${c.name}%`, `%${(c.email || '').split('@')[0] || c.name}%`]
+      )
+      waCount = waRes.rows[0]?.c || 0
+    }
 
-    // Calendar shared events
-    const calRes = await pool.query(
-      `SELECT COUNT(*)::int as c FROM calendar_events
-       WHERE participants ILIKE $1 OR participants ILIKE $2`,
-      [`%${c.name}%`, `%${c.email}%`]
-    )
+    // Calendar shared events (skip if no email)
+    let calCount = 0
+    if (c.email) {
+      const calRes = await pool.query(
+        `SELECT COUNT(*)::int as c FROM calendar_events
+         WHERE participants ILIKE $1 OR participants ILIKE $2`,
+        [`%${c.name}%`, `%${c.email}%`]
+      )
+      calCount = calRes.rows[0]?.c || 0
+    } else {
+      const calRes = await pool.query(
+        `SELECT COUNT(*)::int as c FROM calendar_events
+         WHERE participants ILIKE $1`,
+        [`%${c.name}%`]
+      )
+      calCount = calRes.rows[0]?.c || 0
+    }
 
     // Centrum mentions
     const centRes = await pool.query(
@@ -199,26 +247,38 @@ export async function runRelationshipEngine(): Promise<number> {
       [day90ago, `%${c.name}%`]
     )
 
-    // Email stale days for this contact
-    const threadRes = await pool.query(
-      `SELECT stale_days, awaiting_reply FROM email_threads
-       WHERE participants ILIKE $1 OR last_message_from ILIKE $2
-       ORDER BY stale_days DESC LIMIT 1`,
-      [`%${c.email}%`, `%${c.email}%`]
-    )
+    // Email stale days for this contact (only if email present)
+    let staleDays = 0
+    let awaitingReply = false
+    if (c.email) {
+      const threadRes = await pool.query(
+        `SELECT stale_days, awaiting_reply FROM email_threads
+         WHERE participants ILIKE $1 OR last_message_from ILIKE $2
+         ORDER BY stale_days DESC LIMIT 1`,
+        [`%${c.email}%`, `%${c.email}%`]
+      )
+      staleDays = threadRes.rows[0]?.stale_days || 0
+      awaitingReply = threadRes.rows[0]?.awaiting_reply === 1
+    }
+
+    // Compute unified last_interaction = MAX(last_email, last_whatsapp)
+    const lastEmail = c.last_interaction_at ? new Date(c.last_interaction_at).getTime() : 0
+    const lastWa = c.last_whatsapp_at ? new Date(c.last_whatsapp_at).getTime() : 0
+    const unifiedLast = Math.max(lastEmail, lastWa) || lastEmail || lastWa
+    const unifiedLastIso = unifiedLast > 0 ? new Date(unifiedLast).toISOString() : c.last_interaction_at
 
     enriched.push({
       id: c.id,
       name: c.name,
-      email: c.email,
+      email: c.email || '',
       emailsSent: c.emails_sent || 0,
       emailsReceived: c.emails_received || 0,
       relationshipScore: c.relationship_score || 0,
-      lastInteraction: c.last_interaction_at,
-      staleDays: threadRes.rows[0]?.stale_days || 0,
-      awaitingReply: threadRes.rows[0]?.awaiting_reply === 1,
-      whatsappMsgs30d: waRes.rows[0]?.c || 0,
-      calendarShared: calRes.rows[0]?.c || 0,
+      lastInteraction: unifiedLastIso,
+      staleDays,
+      awaitingReply,
+      whatsappMsgs30d: waCount,
+      calendarShared: calCount,
       centrumMentions: centRes.rows[0]?.c || 0
     })
   }

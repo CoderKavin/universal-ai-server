@@ -2710,6 +2710,45 @@ FORMATTING:
     }
   })
 
+  // Trigger WhatsApp extractor (backfill or incremental)
+  app.post('/api/whatsapp/extract', async (req, res) => {
+    try {
+      const { runWhatsAppExtractor } = await import('./whatsapp-extractor')
+      const backfillAll = req.body?.backfillAll === true
+      const limit = typeof req.body?.limit === 'number' ? req.body.limit : 2000
+      const result = await runWhatsAppExtractor({ limit, backfillAll })
+      res.json({ ok: true, ...result })
+    } catch (err: any) {
+      console.error('[whatsapp/extract] Error:', err.message)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Get WhatsApp extractor status
+  app.get('/api/whatsapp/status', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const [total, parsed, unparsed] = await Promise.all([
+        pool.query(`SELECT COUNT(*)::int AS c FROM observations WHERE source = 'whatsapp'`),
+        pool.query(`SELECT COUNT(*)::int AS c FROM observations WHERE source = 'whatsapp' AND parsed_whatsapp IS NOT NULL`),
+        pool.query(`SELECT COUNT(*)::int AS c FROM observations WHERE source = 'whatsapp' AND parsed_whatsapp IS NULL`),
+      ])
+      const contactsByChannel = await pool.query(
+        `SELECT primary_channel, COUNT(*)::int AS c FROM contacts GROUP BY primary_channel`
+      )
+      res.json({
+        observations: {
+          total: total.rows[0].c,
+          parsed: parsed.rows[0].c,
+          unparsed: unparsed.rows[0].c,
+        },
+        contacts_by_channel: contactsByChannel.rows,
+      })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
   // Diagnostic: WhatsApp / contacts / relationships breakdown
   app.get('/api/admin/whatsapp-diag', async (_req, res) => {
     try {
