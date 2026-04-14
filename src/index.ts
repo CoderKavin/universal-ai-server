@@ -2620,7 +2620,7 @@ FORMATTING:
   app.post('/api/admin/seed-test-data', async (req, res) => {
     try {
       const pool = getPool()
-      const { calendarEvents, actionChains, corrections, contacts, observations } = req.body
+      const { calendarEvents, actionChains, corrections, contacts, observations, predictedActions } = req.body
       const counts: Record<string, number> = {}
 
       for (const c of contacts || []) {
@@ -2677,6 +2677,19 @@ FORMATTING:
       }
       counts.observations = (observations || []).length
 
+      for (const p of predictedActions || []) {
+        await pool.query(
+          `INSERT INTO predicted_actions (id, trigger_context, trigger_type, action_type, title, description, confidence, urgency, expires_at, status, related_entity)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO UPDATE SET
+            title=$5, description=$6, related_entity=$11, status=$10, expires_at=$9`,
+          [p.id, p.trigger_context || '', p.trigger_type || 'test', p.action_type || 'follow_up_draft',
+           p.title, p.description || '', p.confidence || 0.7, p.urgency || 'medium',
+           p.expires_at || new Date(Date.now() + 7 * 86400000).toISOString(),
+           p.status || 'pending', p.related_entity || '']
+        )
+      }
+      counts.predicted_actions = (predictedActions || []).length
+
       res.json({ ok: true, counts })
     } catch (err: any) {
       console.error('[admin/seed] Error:', err.message)
@@ -2691,11 +2704,12 @@ FORMATTING:
       const prefix = 'test-overlay-'
       const results: Record<string, number> = {}
       const ops: [string, string][] = [
-        ['calendar_events', `DELETE FROM calendar_events WHERE id LIKE $1`],
-        ['chain_steps',     `DELETE FROM chain_steps WHERE id LIKE $1 OR chain_id LIKE $1`],
-        ['action_chains',   `DELETE FROM action_chains WHERE id LIKE $1`],
-        ['correction_log',  `DELETE FROM correction_log WHERE id LIKE $1`],
-        ['observations',    `DELETE FROM observations WHERE id LIKE $1`],
+        ['calendar_events',    `DELETE FROM calendar_events WHERE id LIKE $1`],
+        ['chain_steps',        `DELETE FROM chain_steps WHERE id LIKE $1 OR chain_id LIKE $1`],
+        ['action_chains',      `DELETE FROM action_chains WHERE id LIKE $1`],
+        ['correction_log',     `DELETE FROM correction_log WHERE id LIKE $1`],
+        ['observations',       `DELETE FROM observations WHERE id LIKE $1`],
+        ['predicted_actions',  `DELETE FROM predicted_actions WHERE id LIKE $1`],
       ]
       for (const [name, sql] of ops) {
         const r = await pool.query(sql, [`${prefix}%`])
