@@ -1855,8 +1855,9 @@ FORMATTING:
       // Load contacts once (shared across matchers).
       // Use signal-aware filter: if any name in signals, pull that specific contact;
       // otherwise fall back to top-50 by closeness.
+      // Tokenize aggressively: split on any non-alpha char so "rajeev.kumartk" → ["rajeev","kumartk"].
       const signalNames = new Set<string>()
-      const nameWords = allText.match(/\b[a-z][a-z'.-]{2,19}\b/g) || []
+      const nameWords = allText.split(/[^a-z]+/).filter(w => w.length >= 3 && w.length <= 25)
       for (const w of nameWords) signalNames.add(w)
 
       const contacts = signalNames.size > 0
