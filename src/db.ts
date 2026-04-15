@@ -298,6 +298,48 @@ export async function migrate(): Promise<void> {
         WHERE source = 'whatsapp' AND parsed_whatsapp IS NULL;
     `)
 
+    // ── Overlay pipeline rebuild (v2): data quality quarantine ──
+    // Rows that fail the Stage-2 quality filter 3+ times get flagged here
+    // and are skipped by the overlay permanently until manually reviewed.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS overlay_data_quality_issues (
+        id TEXT PRIMARY KEY,
+        source_table TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        failure_count INT DEFAULT 1,
+        last_reason TEXT,
+        first_seen_at TIMESTAMPTZ DEFAULT NOW(),
+        last_seen_at TIMESTAMPTZ DEFAULT NOW(),
+        reviewed BOOLEAN DEFAULT FALSE,
+        review_notes TEXT DEFAULT '',
+        UNIQUE (source_table, source_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_odqi_lookup
+        ON overlay_data_quality_issues (source_table, source_id) WHERE reviewed = FALSE;
+    `)
+
+    // ── Overlay pipeline rebuild (v2): surface visibility heartbeat ──
+    // Other IRIS surfaces (feed, spotlight, whisper, glasses) POST their
+    // visibility state here; overlay Stage-5 queries it to avoid competing.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS surface_state (
+        surface TEXT PRIMARY KEY,
+        visible BOOLEAN DEFAULT FALSE,
+        device_id TEXT,
+        last_event_at TIMESTAMPTZ DEFAULT NOW(),
+        metadata JSONB DEFAULT '{}'
+      );
+    `)
+
+    // Ensure overlay_log has the columns the rebuilt pipeline writes
+    // (matcher_name + stage — needed for per-matcher rate limits and suppression stats)
+    await client.query(`
+      ALTER TABLE overlay_log ADD COLUMN IF NOT EXISTS matcher_name TEXT;
+      ALTER TABLE overlay_log ADD COLUMN IF NOT EXISTS stage INT;
+      CREATE INDEX IF NOT EXISTS idx_overlay_log_matcher
+        ON overlay_log (matcher_name, timestamp DESC);
+    `)
+
     console.log('[db] PostgreSQL tables ready (migrations applied)')
   } finally {
     client.release()

@@ -11,6 +11,63 @@ import crypto from 'crypto'
 
 const GMAIL_API = 'https://gmail.googleapis.com/gmail/v1/users/me'
 
+// ── Commitment extraction hardening ──────────────────────────────
+// Parses Claude's JSON output defensively: handles truncated arrays
+// (if max_tokens was still exceeded) by trimming back to the last
+// complete object and closing the array.
+function safeParseCommitmentArray(raw: string): any[] {
+  const bracketStart = raw.indexOf('[')
+  if (bracketStart < 0) return []
+  let body = raw.slice(bracketStart)
+  try { return JSON.parse(body) } catch {}
+  // Truncated: walk backward to last complete }, then close the array.
+  const lastClose = body.lastIndexOf('}')
+  if (lastClose > 0) {
+    const repaired = body.slice(0, lastClose + 1) + ']'
+    try { return JSON.parse(repaired) } catch {}
+  }
+  return []
+}
+
+// Quality gate for extracted commitments. Anything that doesn't clearly
+// look like a complete, human-readable commitment is dropped at INSERT
+// time so garbage never reaches the overlay.
+function isValidExtractedCommitment(item: any): boolean {
+  if (!item || typeof item !== 'object') return false
+  const desc = typeof item.description === 'string' ? item.description.trim() : ''
+  if (desc.length < 10) return false
+  if (desc.length > 280) return false
+
+  // Truncation artifacts: ends with " X" (single capital) or " Xy" stub
+  if (/\s[A-Z]\.?$/.test(desc)) return false
+  const trailing = desc.split(/\s+/).slice(-1)[0] || ''
+  const allowStubs = new Set(['I', 'a', 'A', 'in', 'on', 'at', 'to', 'of', 'by', 'is', 'it', 'am', 'pm', 'an', 'or', 'be', 'up', 'us'])
+  if (/^[A-Za-z]{1,2}$/.test(trailing) && !allowStubs.has(trailing)) return false
+
+  // Unbalanced punctuation
+  const open = (desc.match(/[([]/g) || []).length
+  const close = (desc.match(/[)\]]/g) || []).length
+  if (open !== close) return false
+
+  // Placeholder / null markers
+  if (/\[(missing|placeholder|todo|\.\.\.|null|undefined)\]/i.test(desc)) return false
+  if (/\b(null|undefined|NaN)\b/.test(desc)) return false
+
+  return true
+}
+
+// Accept only real ISO 8601 dates; reject garbage like "next week".
+function coerceISODate(due: any): string | null {
+  if (due === null || due === undefined || due === '') return null
+  const s = String(due).trim()
+  if (!/^\d{4}-\d{2}-\d{2}/.test(s)) return null
+  const d = new Date(s)
+  if (Number.isNaN(d.getTime())) return null
+  // Reject unix-zero placeholders
+  if (s.startsWith('1970-01-01') || s.startsWith('0000-')) return null
+  return s.slice(0, 10)
+}
+
 // ── Types ─────────────────────────────────────────────────────────
 
 interface GmailMessageMeta {
@@ -434,45 +491,43 @@ async function processEmails(
         const client = new Anthropic({ apiKey })
         const response = await claudeWithFallback(client, {
           model,
-          max_tokens: 600,
+          max_tokens: 2000,
           system: `Extract real commitments and deadlines from these emails. ONLY return genuine commitments — things someone promised to do, deadlines, or action items. Ignore marketing, newsletters, verification codes, receipts, and generic CTAs like "click here" or "take our survey".
 
+Each description must be a COMPLETE, self-contained sentence under 200 chars. Never truncate mid-word or mid-phrase. If you cannot describe a commitment fully, omit it entirely — do not output a partial.
+
+Dates must be ISO 8601 (YYYY-MM-DD) or null. Never output relative dates like "Wednesday" or "next week".
+
 Return JSON array:
-[{"email_index": 1, "description": "what was committed", "by": "who committed", "to": "for whom", "due": "deadline or null"}]
+[{"email_index": 1, "description": "what was committed", "by": "who committed", "to": "for whom", "due": "YYYY-MM-DD or null"}]
 
 If NO real commitments exist, return []. Return ONLY valid JSON.`,
           messages: [{ role: 'user', content: batchText }]
         }, 'gmail-commitments')
 
         const raw = response.content?.[0]?.type === 'text' ? response.content[0].text : '[]'
-        try {
-          const jsonMatch = raw.match(/\[[\s\S]*\]/)
-          if (jsonMatch) {
-            const items = JSON.parse(jsonMatch[0]) as any[]
-            for (const item of items) {
-              if (!item.description) continue
-              const emailIdx = (item.email_index ?? 1) - 1
-              if (emailIdx < 0 || emailIdx >= batch.length) continue
-              const sourceEmail = batch[emailIdx]
+        const parsed = safeParseCommitmentArray(raw)
+        for (const item of parsed) {
+          if (!isValidExtractedCommitment(item)) continue
+          const emailIdx = (item.email_index ?? 1) - 1
+          if (emailIdx < 0 || emailIdx >= batch.length) continue
+          const sourceEmail = batch[emailIdx]
+          const dueISO = coerceISODate(item.due)
 
-              await pool.query(
-                `INSERT INTO commitments (id, description, source_type, source_ref, committed_to, committed_by, due_at, status, ai_confidence)
-                 VALUES ($1, $2, 'email', $3, $4, $5, $6, 'active', $7)`,
-                [
-                  crypto.randomUUID(),
-                  item.description,
-                  sourceEmail?.threadId ?? null,
-                  item.to ?? null,
-                  item.by ?? null,
-                  item.due ?? null,
-                  0.8
-                ]
-              )
-              commitmentsFound++
-            }
-          }
-        } catch {
-          // Skip unparseable AI response
+          await pool.query(
+            `INSERT INTO commitments (id, description, source_type, source_ref, committed_to, committed_by, due_at, status, ai_confidence)
+             VALUES ($1, $2, 'email', $3, $4, $5, $6, 'active', $7)`,
+            [
+              crypto.randomUUID(),
+              String(item.description).trim().slice(0, 280),
+              sourceEmail?.threadId ?? null,
+              item.to ? String(item.to).slice(0, 200) : null,
+              item.by ? String(item.by).slice(0, 200) : null,
+              dueISO,
+              0.8
+            ]
+          )
+          commitmentsFound++
         }
       } catch (err: any) {
         console.error('[gmail-sync] Claude commitment extraction error:', err.message)

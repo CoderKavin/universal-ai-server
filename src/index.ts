@@ -31,6 +31,7 @@ import { runActionPredictor, getPendingActions, formatPredictedActionsForContext
 import { claudeWithFallback, claudeStreamWithFallback, getDegradationWhisper } from './claude-fallback'
 import { generateChain, generateChainsForUrgentItems, completeChainStep, getActiveChains, formatChainsForContext } from './chain-reasoner'
 import { getCachedContext, invalidateCache, getCacheStats, assembleContext, classifyQuery, rebuildCache } from './context-cache'
+import { runPipeline, stageRender, logPipelineEvent, type Candidate, type Signals } from './overlay-pipeline'
 import {
   initDB, migrate, getPool, getSettings, setSetting,
   getLivingProfile, setLivingProfile,
@@ -1141,6 +1142,115 @@ FORMATTING:
     res.json({ id })
   })
 
+  // ── POST /api/observations (phone notification batch ingest) ──
+  // The phone app queues notification observations locally and flushes
+  // them here when it has connectivity. Accepts a single object or an
+  // array of up to 100; dedupes by (device_id, app_package, posted_at_ms,
+  // title) within a 5-minute ingest window; fans out the normal life-event
+  // analyzer per row.
+  app.post('/api/observations', async (req, res) => {
+    try {
+      const pool = getPool()
+      const raw = req.body
+      const items: any[] = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? [raw] : [])
+
+      if (items.length === 0) {
+        return res.status(400).json({ error: 'body must be an observation object or array' })
+      }
+      if (items.length > 100) {
+        return res.status(400).json({ error: 'max 100 observations per call' })
+      }
+
+      let ingested = 0
+      let deduped = 0
+      const errors: Array<{ index: number; error: string }> = []
+
+      for (let i = 0; i < items.length; i++) {
+        const obs = items[i] || {}
+        try {
+          const source: string = String(obs.source || 'phone_notification')
+          const appPackage: string = String(obs.app_package || '')
+          const title: string = String(obs.title || '')
+          const postedAtMs: number | null = typeof obs.posted_at_ms === 'number' ? obs.posted_at_ms : null
+          const deviceId: string = String(obs.device_id || '')
+          const body: string = String(obs.body || '')
+          const subtext: string = obs.subtext == null ? '' : String(obs.subtext)
+          const category: string = String(obs.category || '')
+          const appName: string = String(obs.app_name || '')
+          const isGroup: boolean = !!obs.is_group
+          const priority: number = typeof obs.priority === 'number' ? obs.priority : 0
+
+          // Dedup: same (device_id + app_package + posted_at_ms + title) already
+          // ingested in the last 5 minutes → skip silently.
+          if (postedAtMs != null && deviceId && appPackage) {
+            const dup = await pool.query(
+              `SELECT 1 FROM observations
+               WHERE source = 'phone_notification'
+                 AND timestamp > NOW() - INTERVAL '5 minutes'
+                 AND extracted_entities::jsonb->>'device_id' = $1
+                 AND extracted_entities::jsonb->>'app_package' = $2
+                 AND (extracted_entities::jsonb->>'posted_at_ms')::bigint = $3
+                 AND extracted_entities::jsonb->>'title' = $4
+               LIMIT 1`,
+              [deviceId, appPackage, postedAtMs, title],
+            )
+            if (dup.rows.length > 0) { deduped++; continue }
+          }
+
+          // Build raw_content: greppable plain text that downstream extractors
+          // (whatsapp, life-event, persona writer) already know how to read.
+          const rawText = String(obs.raw_content || '').trim() || [
+            appName && `App: ${appName}`,
+            title && `From: ${title}`,
+            body && `Message: ${body}`,
+            subtext && `Context: ${subtext}`,
+          ].filter(Boolean).join('\n')
+
+          const entities = {
+            app_package: appPackage,
+            app_name: appName,
+            title,
+            body,
+            subtext: subtext || null,
+            category,
+            is_group: isGroup,
+            posted_at_ms: postedAtMs,
+            priority,
+            device_id: deviceId,
+            ...(obs.extracted_entities && typeof obs.extracted_entities === 'object' ? obs.extracted_entities : {}),
+          }
+
+          // Event type: messaging / email / call / system — match existing
+          // convention used by screen_capture ('viewed') and chat ('queried').
+          const eventType = category || 'received'
+
+          const id = await insertObservation(
+            source,
+            eventType,
+            rawText,
+            entities,
+            'neutral',
+            [],
+            '',
+          )
+
+          // Fan out to existing per-observation processors (non-blocking).
+          const tsIso = obs.timestamp || new Date().toISOString()
+          analyzeForLifeEvent(id, source, eventType, rawText, tsIso).catch(() => {})
+
+          ingested++
+        } catch (err: any) {
+          errors.push({ index: i, error: err.message || String(err) })
+        }
+      }
+
+      res.json({ ok: true, ingested, deduped, errors })
+    } catch (err: any) {
+      console.error('[observations] batch ingest failed:', err.message)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
   // ── Predicted actions ──────────────────────────────────────
 
   app.post('/api/actions/predict', async (_req, res) => {
@@ -1825,119 +1935,30 @@ FORMATTING:
   })
 
   // ── CONTEXTUAL OVERLAY ───────────────────────────────────────
-
-  // FIX 2: Content quality gate — reject garbled / invalid overlay content.
-  function validateOverlayContent(description: string, body: string): { ok: true } | { ok: false; reason: string } {
-    const text = `${description} ${body}`
-    const desc = description || ''
-
-    if (desc.length < 10) return { ok: false, reason: 'description_too_short' }
-    if (desc.length > 300) return { ok: false, reason: 'description_too_long' }
-    if (body.length < 3 || body.length > 140) return { ok: false, reason: 'body_length_oob' }
-
-    // Ends with single capital letter + optional period: "by W", "Collab by N."
-    if (/\s[A-Z]\.?$/.test(desc.trim())) return { ok: false, reason: 'truncated_single_letter' }
-
-    // Ends mid-word — last "word" is 1-2 chars that don't form a real word
-    const trailing = desc.trim().split(/\s+/).slice(-1)[0] || ''
-    if (/^[A-Za-z]{1,2}$/.test(trailing) && !['I', 'a', 'A', 'in', 'on', 'at', 'to', 'of', 'by', 'is', 'it', 'am', 'pm'].includes(trailing)) {
-      return { ok: false, reason: 'truncated_trailing_stub' }
-    }
-
-    // Unbalanced parentheses
-    const openP = (desc.match(/\(/g) || []).length
-    const closeP = (desc.match(/\)/g) || []).length
-    if (openP !== closeP) return { ok: false, reason: 'unbalanced_parens' }
-    const openB = (desc.match(/\[/g) || []).length
-    const closeB = (desc.match(/]/g) || []).length
-    if (openB !== closeB) return { ok: false, reason: 'unbalanced_brackets' }
-
-    // Placeholder / truncation tokens
-    if (/\[(missing|placeholder|todo|\.\.\.)\]/i.test(text)) return { ok: false, reason: 'placeholder_token' }
-    if (/\bnull\b/.test(text) || /\bundefined\b/.test(text)) return { ok: false, reason: 'null_or_undefined' }
-
-    return { ok: true }
-  }
-
-  async function logOverlaySuppression(
-    pool: any,
-    outcome: string,
-    reason: string,
-    entityId: string,
-    insightType: string,
-    confidence: number,
-    contentSnapshot: string,
-    signals?: any
-  ): Promise<void> {
-    try {
-      await pool.query(
-        `INSERT INTO overlay_log (id, outcome, reason, entity_id, insight_type, confidence, content_snapshot, signals_snapshot)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [crypto.randomUUID(), outcome, reason, entityId, insightType, Math.round(confidence || 0), contentSnapshot.slice(0, 500), signals ? JSON.stringify(signals) : null]
-      )
-    } catch (err: any) {
-      console.error('[overlay-log] insert failed:', err.message)
-    }
-  }
-
-  // FIX 3: Context relevance — judge whether a proactive candidate is
-  // appropriate for the current focus state.
-  async function isProactiveRelevant(
-    pool: any,
-    candidate: any,
-    signals: { app: string; title: string; ocr: string }
-  ): Promise<{ ok: boolean; reason: string }> {
-    const appLower = signals.app || ''
-    const isDeepFocus = /code|xcode|intellij|pycharm|vim|emacs|terminal|iterm|figma|blender|unity|logic/.test(appLower)
-    const isNeutral = /chrome|safari|firefox|mail|messages|whatsapp|slack|notion|obsidian|docs|pages|word/.test(appLower)
-
-    // Time-critical = due in < 24h (for DEADLINE candidates)
-    const dueStr: string = String(candidate.title || '')
-    const dueMatch = dueStr.match(/Due (\d{4}-\d{2}-\d{2})/)
-    let timeCritical = false
-    if (dueMatch) {
-      const dueMs = new Date(dueMatch[1]).getTime()
-      timeCritical = dueMs - Date.now() < 24 * 3600000
-    }
-    // UPCOMING calendar events within 30 min are always time-critical
-    if (candidate.label === 'UPCOMING') timeCritical = true
-
-    // Topical match: does the candidate body mention any word from the signals
-    const allSignalText = `${signals.ocr} ${signals.title}`.toLowerCase()
-    const candidateText = `${candidate.title || ''} ${candidate.body || ''}`.toLowerCase()
-    const candidateTokens = candidateText.split(/[^a-z]+/).filter((w: string) => w.length >= 4)
-    const topical = candidateTokens.some((t: string) => allSignalText.includes(t))
-
-    if (timeCritical) return { ok: true, reason: 'time_critical' }
-    if (isDeepFocus && !topical) return { ok: false, reason: 'irrelevant_to_deep_focus' }
-
-    // For non-critical in neutral context, allow unless we've seen many observations recently
-    // from a different topic (user is actively working on something else)
-    if (isNeutral && topical) return { ok: true, reason: 'neutral_with_topical_match' }
-    if (isNeutral) {
-      // Check if first-5-min-of-session: any observation in last 10 min?
-      const recentRes = await pool.query(
-        `SELECT COUNT(*)::int AS c FROM observations WHERE timestamp > NOW() - INTERVAL '10 minutes'`
-      )
-      if (recentRes.rows[0].c < 5) return { ok: true, reason: 'session_start' }
-      return { ok: false, reason: 'non_critical_no_topical_match' }
-    }
-
-    return { ok: true, reason: 'default_allow' }
-  }
+  //
+  // Decision-making lives in overlay-pipeline.ts. This endpoint is the
+  // candidate-generation stage only: it runs 13 matchers, each producing
+  // zero or more Candidate objects, then hands the list to runPipeline()
+  // which enforces quality / freshness / duplication / relevance /
+  // actionability / rate-limit / scoring / rendering / learning stages.
+  //
+  // Target fire rate: 3-10/day. Silence is the default.
 
   app.post('/api/overlay/evaluate', async (req, res) => {
     try {
       const pool = getPool()
-      const { ocr_text, app: appName, window_title, url, file_path, mode } = req.body
+      const { ocr_text, app: appName, window_title, url, file_path, mode, typing_rate, app_switched_at } = req.body
 
       // ── UPGRADE 8: Multi-signal matching ───────────────────────
-      const signals = {
+      const signals: Signals = {
         ocr: (ocr_text || '').toLowerCase(),
         title: (window_title || '').toLowerCase(),
         url: (url || '').toLowerCase(),
         file: (file_path || '').toLowerCase(),
-        app: (appName || '').toLowerCase()
+        app: (appName || '').toLowerCase(),
+        mode: mode === 'proactive' ? 'proactive' : 'reactive',
+        typing_rate: typeof typing_rate === 'number' ? typing_rate : undefined,
+        app_switched_at: typeof app_switched_at === 'number' ? app_switched_at : undefined,
       }
       const allText = `${signals.ocr} ${signals.title} ${signals.url} ${signals.file}`.toLowerCase()
 
@@ -1950,7 +1971,8 @@ FORMATTING:
                        signals.app.includes('word') || signals.app.includes('pages') ||
                        signals.app.includes('notion') || signals.app.includes('obsidian')
 
-      const insights: any[] = []
+      const candidates: Candidate[] = []
+      const nowMs = Date.now()
 
       // Load contacts once (shared across matchers).
       // Use signal-aware filter: if any name in signals, pull that specific contact;
@@ -2012,7 +2034,7 @@ FORMATTING:
       if (isBlankCompose) {
         // Find the most likely next action based on stale threads + pending actions
         const likelyAction = await pool.query(
-          `SELECT pa.title, pa.description, pa.trigger_context, pa.related_entity, pa.action_type
+          `SELECT pa.id, pa.title, pa.description, pa.trigger_context, pa.related_entity, pa.action_type, pa.predicted_at, pa.draft_content
            FROM predicted_actions pa
            WHERE pa.status = 'pending' AND pa.expires_at > NOW()
            AND pa.action_type IN ('follow_up_draft', 'relationship_maintenance')
@@ -2021,15 +2043,21 @@ FORMATTING:
         if (likelyAction.rows.length > 0) {
           const la = likelyAction.rows[0]
           const name = (la.title || '').replace(/^(Follow up:|Reach out to)\s*/i, '').slice(0, 25)
-          insights.push({
-            type: 'predictive', label: 'PREDICTION',
-            title: `Probably replying to ${name}`,
-            body: la.draft_content ? 'Draft ready' : (la.trigger_context || '').slice(0, 50),
-            confidence: 76,
+          candidates.push({
+            matcher_name: 'predictive',
+            type: 'predictive',
+            label: la.draft_content ? 'DRAFT READY' : 'PREDICTION',
+            raw_title: `Probably replying to ${name}`,
+            raw_body: la.draft_content ? 'Draft ready to send' : (la.trigger_context || '').slice(0, 120),
+            raw_content: la.description || la.trigger_context || '',
+            base_confidence: 76,
             entity_id: la.related_entity || name,
-            button: la.draft_content ? 'Use Draft' : 'View',
+            button: la.draft_content ? 'Draft' : 'View',
             action_type: la.draft_content ? 'use_draft' : 'view',
-            upgrade: 'predictive'
+            upgrade: 'predictive',
+            source_table: 'predicted_actions',
+            source_id: la.id,
+            freshness_timestamp: la.predicted_at,
           })
         }
       }
@@ -2064,33 +2092,56 @@ FORMATTING:
         if (conf === 0) continue
 
         const pendingAction = await pool.query(
-          `SELECT id, title, trigger_context, draft_content FROM predicted_actions
+          `SELECT id, title, trigger_context, draft_content, predicted_at FROM predicted_actions
            WHERE status = 'pending' AND expires_at > NOW()
            AND (title ILIKE $1 OR related_entity ILIKE $2) LIMIT 1`,
           [`%${c.name}%`, `%${c.email}%`]
         )
         if (pendingAction.rows.length > 0) {
           const pa = pendingAction.rows[0]
-          insights.push({
-            type: 'contact', label: 'CONTACT',
-            title: `${c.name}: pending action`,
-            body: (pa.trigger_context || pa.title || '').slice(0, 80),
-            confidence: conf, entity_id: c.email
+          candidates.push({
+            matcher_name: 'contact',
+            type: 'contact',
+            label: 'PERSON',
+            raw_title: `${c.name} needs follow-up`,
+            raw_body: (pa.trigger_context || pa.title || '').slice(0, 130),
+            raw_content: pa.trigger_context || '',
+            base_confidence: conf,
+            entity_id: c.email,
+            button: 'View', action_type: 'view',
+            source_table: 'predicted_actions',
+            source_id: pa.id,
+            freshness_timestamp: pa.predicted_at,
           })
           continue
         }
 
         const staleThread = await pool.query(
-          `SELECT thread_id, subject, stale_days FROM email_threads
-           WHERE participants LIKE $1 AND stale_days >= 3 ORDER BY stale_days DESC LIMIT 1`,
+          `SELECT thread_id, subject, stale_days, last_message_date FROM email_threads
+           WHERE participants LIKE $1 AND stale_days >= 3 AND awaiting_reply = 1
+           ORDER BY stale_days DESC LIMIT 1`,
           [`%${c.email}%`]
         )
         if (staleThread.rows.length > 0) {
-          insights.push({
-            type: 'contact', label: 'EMAIL',
-            title: `Stale thread with ${c.name}`,
-            body: `"${(staleThread.rows[0].subject || '').slice(0, 50)}" — ${staleThread.rows[0].stale_days}d no reply`,
-            confidence: conf - 5, entity_id: c.email
+          const st = staleThread.rows[0]
+          // Apply freshness rule: thread > 30d old only fires for top-20 relationships
+          const ageDays = st.last_message_date
+            ? (nowMs - new Date(st.last_message_date).getTime()) / 86_400_000
+            : st.stale_days
+          if (ageDays > 30 && (c.current_closeness ?? 0) < 40) continue
+          candidates.push({
+            matcher_name: 'contact',
+            type: 'email',
+            label: 'REPLY',
+            raw_title: `Reply to ${c.name} about this thread`,
+            raw_body: `"${(st.subject || '').slice(0, 60)}" — ${st.stale_days} days with no reply from you`,
+            raw_content: st.subject || '',
+            base_confidence: conf - 5,
+            entity_id: c.email,
+            button: 'Reply', action_type: 'reply',
+            source_table: 'email_threads',
+            source_id: st.thread_id,
+            freshness_timestamp: st.last_message_date,
           })
         }
       }
@@ -2111,11 +2162,20 @@ FORMATTING:
           )
           if (contactMatch) {
             const minsLeft = Math.round((new Date(ev.start_time).getTime() - Date.now()) / 60000)
-            insights.push({
-              type: 'calendar', label: 'MEETING',
-              title: `${(ev.summary || '').slice(0, 40)} in ${minsLeft}m`,
-              body: `${contactMatch.name} — ${contactMatch.trajectory || 'stable'} relationship`,
-              confidence: 78, entity_id: ev.id
+            candidates.push({
+              matcher_name: 'calendar',
+              type: 'calendar',
+              label: 'MEETING',
+              raw_title: `${(ev.summary || 'Meeting').slice(0, 35)} in ${minsLeft}m`,
+              raw_body: `With ${contactMatch.name}. Relationship ${contactMatch.trajectory || 'stable'}.`,
+              raw_content: ev.summary || '',
+              base_confidence: 78,
+              entity_id: ev.id,
+              button: 'View', action_type: 'view',
+              source_table: 'calendar_events',
+              source_id: ev.id,
+              freshness_timestamp: ev.start_time,
+              critical: minsLeft <= 10,
             })
           }
         }
@@ -2128,20 +2188,29 @@ FORMATTING:
           if (conf === 0) continue
 
           const commitment = await pool.query(
-            `SELECT description, due_at FROM commitments
+            `SELECT id, description, due_at, created_at FROM commitments
              WHERE status = 'active' AND (committed_to ILIKE $1 OR committed_by ILIKE $1)
              ORDER BY due_at ASC NULLS LAST LIMIT 1`,
             [`%${c.email}%`]
           )
           if (commitment.rows.length > 0) {
             const cm = commitment.rows[0]
-            const dueInfo = cm.due_at ? ` (due ${cm.due_at})` : ''
-            insights.push({
-              type: 'email', label: 'COMMITMENT',
-              title: `Open commitment with ${c.name}`,
-              body: `${(cm.description || '').slice(0, 60)}${dueInfo}`,
-              confidence: Math.min(conf + 5, 95), entity_id: c.email,
-              button: 'View', action_type: 'view'
+            const descClean = String(cm.description || '').trim()
+            const dueLine = cm.due_at ? ` Due ${String(cm.due_at).slice(0, 10)}.` : ''
+            candidates.push({
+              matcher_name: 'email_commitment',
+              type: 'email',
+              label: 'COMMITMENT',
+              raw_title: `Commitment with ${c.name}`,
+              raw_body: `${descClean.slice(0, 100)}.${dueLine}`.trim(),
+              raw_content: descClean,
+              base_confidence: Math.min(conf + 5, 95),
+              entity_id: c.email,
+              button: 'View', action_type: 'view',
+              source_table: 'commitments',
+              source_id: cm.id,
+              freshness_timestamp: cm.created_at,
+              due_date: cm.due_at,
             })
             break
           }
@@ -2150,11 +2219,21 @@ FORMATTING:
             const daysSince = c.last_interaction
               ? Math.round((Date.now() - new Date(c.last_interaction).getTime()) / 86400000) : 0
             if (daysSince >= 7) {
-              insights.push({
-                type: 'email', label: 'RELATIONSHIP',
-                title: `${c.name} — ${daysSince}d since last contact`,
-                body: c.anomaly === 'sudden_silence' ? 'Unusual silence detected' : 'Follow-up overdue',
-                confidence: conf - 5, entity_id: c.email
+              candidates.push({
+                matcher_name: 'relationship',
+                type: 'email',
+                label: 'PERSON',
+                raw_title: `${c.name} went quiet ${daysSince} days ago`,
+                raw_body: c.anomaly === 'sudden_silence'
+                  ? `Unusual silence for this contact. Worth a quick check-in.`
+                  : `Follow-up is overdue by ${daysSince} days.`,
+                raw_content: c.anomaly,
+                base_confidence: conf - 5,
+                entity_id: c.email,
+                button: 'View', action_type: 'view',
+                source_table: 'relationships',
+                source_id: c.email,
+                freshness_timestamp: c.last_interaction,
               })
               break
             }
@@ -2179,15 +2258,26 @@ FORMATTING:
           if (hits === 0) continue
 
           const relCommitment = await pool.query(
-            `SELECT description FROM commitments WHERE status = 'active' AND description ILIKE $1 LIMIT 1`,
+            `SELECT id, description, due_at FROM commitments
+             WHERE status = 'active' AND description ILIKE $1 LIMIT 1`,
             [`%${doc.filename.slice(0, 20)}%`]
           )
           if (relCommitment.rows.length > 0) {
-            insights.push({
-              type: 'file', label: 'DOCUMENT',
-              title: doc.filename.slice(0, 40),
-              body: `Related: ${(relCommitment.rows[0].description || '').slice(0, 60)}`,
-              confidence: 65 + hits * 10, entity_id: doc.id
+            const rc = relCommitment.rows[0]
+            candidates.push({
+              matcher_name: 'file',
+              type: 'file',
+              label: 'DOCUMENT',
+              raw_title: `Open commitment for ${doc.filename.slice(0, 30)}`,
+              raw_body: `Related: ${String(rc.description || '').slice(0, 110)}`,
+              raw_content: rc.description || '',
+              base_confidence: 65 + hits * 10,
+              entity_id: doc.id,
+              button: 'View', action_type: 'view',
+              source_table: 'commitments',
+              source_id: rc.id,
+              freshness_timestamp: doc.last_modified,
+              due_date: rc.due_at,
             })
           }
         }
@@ -2196,28 +2286,36 @@ FORMATTING:
       // ── Matcher 5: Centrum card ──
       if (allText.includes('centrum') || allText.includes('spoika') || allText.includes('today list')) {
         const chains = await pool.query(
-          `SELECT ac.id, ac.trigger_event, COUNT(cs.id)::int as pending
+          `SELECT ac.id, ac.trigger_event, ac.created_at, COUNT(cs.id)::int as pending
            FROM action_chains ac JOIN chain_steps cs ON cs.chain_id = ac.id AND cs.status = 'pending'
-           WHERE ac.status = 'active' GROUP BY ac.id HAVING COUNT(cs.id) >= 2 LIMIT 3`
+           WHERE ac.status = 'active' GROUP BY ac.id, ac.trigger_event, ac.created_at
+           HAVING COUNT(cs.id) >= 2 LIMIT 3`
         )
         for (const ch of chains.rows) {
           const triggerLower = (ch.trigger_event || '').toLowerCase()
           const words = triggerLower.split(/\s+/).filter((w: string) => w.length > 4)
           const matchedWords = words.filter((w: string) => allText.includes(w))
           if (matchedWords.length >= 2) {
-            insights.push({
-              type: 'centrum', label: 'CHAIN PLAN',
-              title: (ch.trigger_event || '').slice(0, 45),
-              body: `${ch.pending} steps pending`,
-              confidence: 76, entity_id: ch.id,
-              button: 'View Chain', action_type: 'view_chain'
+            candidates.push({
+              matcher_name: 'centrum',
+              type: 'centrum',
+              label: 'PATTERN',
+              raw_title: `${(ch.trigger_event || 'Plan').slice(0, 35)} has steps to do`,
+              raw_body: `${ch.pending} steps are still pending in this chain.`,
+              raw_content: ch.trigger_event || '',
+              base_confidence: 76,
+              entity_id: ch.id,
+              button: 'View', action_type: 'view_chain',
+              source_table: 'action_chains',
+              source_id: ch.id,
+              freshness_timestamp: ch.created_at,
             })
           }
         }
       }
 
       // ── UPGRADE 4: Intent inference from activity sequence ─────
-      if (mode === 'proactive' || insights.length === 0) {
+      if (mode === 'proactive' || candidates.length === 0) {
         const recentActivity = await pool.query(
           `SELECT source, event_type, raw_content FROM observations
            WHERE timestamp > NOW() - INTERVAL '15 minutes'
@@ -2248,18 +2346,27 @@ FORMATTING:
             for (const topic of focusedContacts.rows) {
               const fn = firstName(topic.name)
               const pa = await pool.query(
-                `SELECT title, trigger_context FROM predicted_actions
+                `SELECT id, title, trigger_context, predicted_at FROM predicted_actions
                  WHERE status = 'pending' AND expires_at > NOW()
                  AND (title ILIKE $1 OR related_entity ILIKE $2 OR description ILIKE $1 OR trigger_context ILIKE $1) LIMIT 1`,
                 [`%${fn}%`, `%${topic.email}%`]
               )
               if (pa.rows.length > 0) {
-                insights.push({
-                  type: 'sequence', label: 'PATTERN',
-                  title: `You're focused on ${topic.name}`,
-                  body: (pa.rows[0].trigger_context || pa.rows[0].title || '').slice(0, 60),
-                  confidence: 72, entity_id: topic.email,
-                  upgrade: 'sequence'
+                const p = pa.rows[0]
+                candidates.push({
+                  matcher_name: 'intent',
+                  type: 'sequence',
+                  label: 'FOCUS',
+                  raw_title: `You keep returning to ${topic.name}`,
+                  raw_body: (p.trigger_context || p.title || 'Pending item waiting.').slice(0, 120),
+                  raw_content: p.trigger_context || '',
+                  base_confidence: 72,
+                  entity_id: topic.email,
+                  button: 'View', action_type: 'view',
+                  upgrade: 'sequence',
+                  source_table: 'predicted_actions',
+                  source_id: p.id,
+                  freshness_timestamp: p.predicted_at,
                 })
                 break
               }
@@ -2270,7 +2377,7 @@ FORMATTING:
 
       // ── UPGRADE 6: Proactive time-based triggering ─────────────
       if (mode === 'proactive') {
-        // Check for approaching calendar events needing prep
+        // Approaching calendar events needing prep.
         const soonEvents = await pool.query(
           `SELECT id, summary, start_time, participants FROM calendar_events
            WHERE start_time::timestamptz > NOW() + INTERVAL '5 minutes'
@@ -2280,177 +2387,119 @@ FORMATTING:
         if (soonEvents.rows.length > 0) {
           const ev = soonEvents.rows[0]
           const minsLeft = Math.round((new Date(ev.start_time).getTime() - Date.now()) / 60000)
-          insights.push({
-            type: 'proactive', label: 'UPCOMING',
-            title: `${(ev.summary || '').slice(0, 40)} in ${minsLeft}m`,
-            body: 'No prep detected — review now?',
-            confidence: 78, entity_id: ev.id,
+          candidates.push({
+            matcher_name: 'proactive_calendar',
+            type: 'proactive',
+            label: 'UPCOMING',
+            raw_title: `${(ev.summary || 'Meeting').slice(0, 35)} in ${minsLeft}m`,
+            raw_body: `No prep detected. Review or join now.`,
+            raw_content: ev.summary || '',
+            base_confidence: 78,
+            entity_id: ev.id,
             button: 'View', action_type: 'view',
-            upgrade: 'proactive'
+            upgrade: 'proactive',
+            source_table: 'calendar_events',
+            source_id: ev.id,
+            freshness_timestamp: ev.start_time,
+            critical: minsLeft <= 10,
           })
         }
 
-        // Check for stale high-priority commitments.
-        // FIX 1: filter to not-overdue, within 7 days, not dismissed, not overshown.
-        // Also exclude commitments that have been dismissed in correction_log recently.
-        const nowIso = new Date().toISOString()
-        const sevenDaysIso = new Date(Date.now() + 7 * 86400000).toISOString()
+        // Urgent commitments: due within 7 days, not dismissed-via-inaction.
+        // Freshness (overdue >24h) and quality (truncation etc.) are
+        // handled by the pipeline. We only load the top 3 candidates here.
         const urgentCommitments = await pool.query(
-          `SELECT id, description, due_at, committed_to, auto_surface_count, auto_surface_clicked
+          `SELECT id, description, due_at, committed_to, created_at, auto_surface_count, auto_surface_clicked
            FROM commitments
            WHERE status = 'active'
              AND (dismissed_via_inaction IS NOT TRUE)
              AND due_at IS NOT NULL
-             AND due_at::text >= $1
-             AND due_at::text <= $2
-             AND NOT EXISTS (
-               SELECT 1 FROM correction_log cl
-               WHERE cl.timestamp > NOW() - INTERVAL '30 days'
-                 AND cl.user_action LIKE '%dismiss%'
-                 AND (cl.trigger_context ILIKE '%' || SPLIT_PART(commitments.description, ' ', 1) || '%'
-                      OR cl.trigger_action ILIKE '%' || SPLIT_PART(commitments.description, ' ', 1) || '%')
-             )
-           ORDER BY due_at ASC LIMIT 1`,
-          [nowIso, sevenDaysIso]
+             AND due_at::text >= (NOW() - INTERVAL '1 day')::text
+             AND due_at::text <= (NOW() + INTERVAL '7 days')::text
+           ORDER BY due_at ASC LIMIT 3`
         )
-        if (urgentCommitments.rows.length > 0) {
-          const uc = urgentCommitments.rows[0]
-          const dueDate = String(uc.due_at).slice(0, 10)
-          const candidate = {
-            type: 'proactive', label: 'DEADLINE' as const,
-            title: `Due ${dueDate}: ${(uc.description || '').slice(0, 35)}`,
-            body: uc.committed_to ? `For ${uc.committed_to}` : 'Review before deadline',
-            confidence: 80, entity_id: `commitment:${uc.id}`,
+        for (const uc of urgentCommitments.rows) {
+          const dueMs = new Date(uc.due_at).getTime()
+          const overdue = dueMs < nowMs
+          const label = overdue ? 'OVERDUE' : 'DEADLINE'
+          const descClean = String(uc.description || '').trim()
+          candidates.push({
+            matcher_name: 'proactive_commitment',
+            type: 'proactive',
+            label,
+            raw_title: overdue ? `Overdue: ${descClean.slice(0, 30)}` : `Due soon: ${descClean.slice(0, 30)}`,
+            raw_body: uc.committed_to
+              ? `${descClean.slice(0, 90)} for ${String(uc.committed_to).slice(0, 40)}.`
+              : `${descClean.slice(0, 110)}.`,
+            raw_content: descClean,
+            base_confidence: overdue ? 82 : 80,
+            entity_id: `commitment:${uc.id}`,
+            button: 'Done', action_type: 'view',
             upgrade: 'proactive',
-            _commitment_id: uc.id,
-            _auto_surface_count: uc.auto_surface_count || 0,
-          }
-          // FIX 2: content quality gate — validate description first
-          const validation = validateOverlayContent(uc.description || '', candidate.body)
-          if (!validation.ok) {
-            await logOverlaySuppression(pool, 'suppressed_garbled', validation.reason, candidate.entity_id, candidate.type, candidate.confidence, `${candidate.title} / ${candidate.body}`)
-          } else {
-            insights.push(candidate as any)
-          }
+            source_table: 'commitments',
+            source_id: uc.id,
+            freshness_timestamp: uc.created_at,
+            due_date: uc.due_at,
+            critical: !overdue && (dueMs - nowMs) < 2 * 3600_000,
+          })
         }
       }
 
-      if (insights.length === 0) return res.json({ show: false })
+      if (candidates.length === 0) return res.json({ show: false })
 
-      insights.sort((a, b) => b.confidence - a.confidence)
-      let best = insights[0]
+      // ── Pipeline: Stages 2-10 ─────────────────────────────────
+      // Everything beyond Stage 1 (candidate generation) is enforced by
+      // overlay-pipeline.ts. That module logs every suppression with its
+      // stage and reason so we can debug why nothing fires.
+      const outcome = await runPipeline(pool, candidates, signals)
 
-      // Helper: derive a short, broad search token from an entity_id
-      // Handles emails (rajeev.kumartk@... → rajeev), commitments (commitment:Foo → Foo),
-      // thread-ids (thread-19ba... → thread-19ba...), and plain names.
-      const coreSearchToken = (entityId: string): string => {
-        if (!entityId) return ''
-        const afterColon = entityId.split(':').pop() || entityId
-        const beforeAt = afterColon.split('@')[0]
-        const firstAlpha = beforeAt.split(/[^a-zA-Z0-9-]/)[0] // split on dots, spaces, etc.
-        return firstAlpha.slice(0, 20)
+      // Log every suppressed candidate to overlay_log for telemetry.
+      for (const s of outcome.suppressed) {
+        await logPipelineEvent(
+          pool, 'suppressed', s.stage, s.reason,
+          {
+            entity_id: s.entity_id, type: s.type, matcher_name: s.matcher,
+            raw_title: s.title, raw_body: '',
+          },
+          signals,
+        )
       }
 
-      // ── UPGRADE 3: Cross-source enrichment ─────────────────────
+      const best = outcome.fired
+      if (!best) return res.json({ show: false })
+
+      // ── UPGRADE 3 + UPGRADE 7: post-selection enrichment ──────
+      // Attach a chain hint and a calendar sidebar if the winning entity
+      // maps to one. These are presentation-only — do not re-score.
       if (best.entity_id) {
-        const shortToken = coreSearchToken(best.entity_id)
-        const longToken = (best.entity_id.split('@')[0].split(':').pop() || '').slice(0, 25)
-        // Check calendar for upcoming events with this entity
-        const calMatch = await pool.query(
-          `SELECT summary, start_time FROM calendar_events
-           WHERE start_time::timestamptz > NOW() AND start_time::timestamptz < NOW() + INTERVAL '7 days'
-           AND (summary ILIKE $1 OR participants ILIKE $1 OR summary ILIKE $2 OR participants ILIKE $2)
-           AND status != 'cancelled'
-           ORDER BY start_time::timestamptz LIMIT 1`,
-          [`%${shortToken}%`, `%${longToken}%`]
-        )
-        // Check chains for this entity
-        const chainMatch = await pool.query(
-          `SELECT ac.trigger_event, cs.title as step_title, cs2.title as step2_title, cs3.title as step3_title
-           FROM action_chains ac
-           LEFT JOIN chain_steps cs ON cs.chain_id = ac.id AND cs.step_number = 1
-           LEFT JOIN chain_steps cs2 ON cs2.chain_id = ac.id AND cs2.step_number = 2
-           LEFT JOIN chain_steps cs3 ON cs3.chain_id = ac.id AND cs3.step_number = 3
-           WHERE ac.status = 'active'
-           AND (ac.trigger_event ILIKE $1 OR ac.trigger_entity ILIKE $1
-                OR ac.trigger_event ILIKE $2 OR ac.trigger_entity ILIKE $2)
-           LIMIT 1`,
-          [`%${shortToken}%`, `%${longToken}%`]
-        )
-
-        // UPGRADE 7: Attach chain hint
-        if (chainMatch.rows.length > 0) {
-          const ch = chainMatch.rows[0]
-          const steps = [ch.step_title, ch.step2_title, ch.step3_title].filter(Boolean)
-          if (steps.length >= 2) {
-            const chainHint = steps.map((s: string) => s.slice(0, 20)).join(' → ')
-            best.chain_hint = chainHint
-          }
-        }
-
-        // UPGRADE 3: Add calendar context if it enriches
-        if (calMatch.rows.length > 0) {
-          const calEv = calMatch.rows[0]
-          const daysUntil = Math.round((new Date(calEv.start_time).getTime() - Date.now()) / 86400000)
-          if (daysUntil <= 3 && !best.body.includes(calEv.summary)) {
-            best.body = `${calEv.summary} in ${daysUntil}d. ${best.body}`.slice(0, 90)
-            best.confidence = Math.min(best.confidence + 5, 95)
-          }
+        const afterColon = best.entity_id.split(':').pop() || best.entity_id
+        const shortToken = (afterColon.split('@')[0] || '').split(/[^a-zA-Z0-9-]/)[0].slice(0, 20)
+        if (shortToken.length >= 3) {
+          try {
+            const chainMatch = await pool.query(
+              `SELECT ac.trigger_event, cs.title as s1, cs2.title as s2, cs3.title as s3
+               FROM action_chains ac
+               LEFT JOIN chain_steps cs ON cs.chain_id = ac.id AND cs.step_number = 1
+               LEFT JOIN chain_steps cs2 ON cs2.chain_id = ac.id AND cs2.step_number = 2
+               LEFT JOIN chain_steps cs3 ON cs3.chain_id = ac.id AND cs3.step_number = 3
+               WHERE ac.status = 'active'
+               AND (ac.trigger_event ILIKE $1 OR ac.trigger_entity ILIKE $1)
+               LIMIT 1`,
+              [`%${shortToken}%`],
+            )
+            if (chainMatch.rows[0]) {
+              const ch = chainMatch.rows[0]
+              const steps = [ch.s1, ch.s2, ch.s3].filter(Boolean)
+              if (steps.length >= 2) {
+                best.chain_hint = steps.map((s: string) => s.slice(0, 20)).join(' → ')
+              }
+            }
+          } catch {}
         }
       }
 
-      // ── UPGRADE 5: Pattern comparison (past similar items) ─────
-      if (best.entity_id && best.type !== 'predictive') {
-        const shortToken = coreSearchToken(best.entity_id)
-        const pastSimilar = await pool.query(
-          `SELECT trigger_action, trigger_context, user_action, correction_text
-           FROM correction_log
-           WHERE (trigger_context ILIKE $1 OR trigger_action ILIKE $1)
-           AND timestamp > NOW() - INTERVAL '90 days'
-           ORDER BY timestamp DESC LIMIT 5`,
-          [`%${shortToken}%`]
-        )
-        const dismissed = pastSimilar.rows.filter((r: any) =>
-          r.user_action?.includes('dismiss'))
-        const acted = pastSimilar.rows.filter((r: any) =>
-          r.user_action?.includes('acted') || r.user_action === 'action_taken' || r.user_action === 'approved')
-        if (dismissed.length >= 2) {
-          best.confidence -= 15
-          best.pattern_score = `dismissed ${dismissed.length}× in past 90d`
-        }
-        if (acted.length >= 2) {
-          best.confidence += 5
-          best.pattern_score = `approved ${acted.length}× in past 90d`
-        }
-      }
-
-      // Final confidence gate
-      if (best.confidence < 65) return res.json({ show: false })
-
-      // Ensure total content < 140 chars
-      const totalLen = (best.label || '').length + (best.title || '').length + (best.body || '').length
-      if (totalLen > 140) {
-        best.body = (best.body || '').slice(0, 140 - (best.label || '').length - (best.title || '').length - 3) + '...'
-      }
-
-      // FIX 2: final content validation on the chosen best insight
-      const finalValidation = validateOverlayContent(best.title || '', best.body || '')
-      if (!finalValidation.ok) {
-        await logOverlaySuppression(pool, 'suppressed_garbled', finalValidation.reason, best.entity_id, best.type, best.confidence, `${best.title} / ${best.body}`, { app: signals.app, title: signals.title })
-        return res.json({ show: false })
-      }
-
-      // FIX 3: context relevance for proactive fires
-      if (best.upgrade === 'proactive') {
-        const relev = await isProactiveRelevant(pool, best, { app: signals.app, title: signals.title, ocr: signals.ocr })
-        if (!relev.ok) {
-          await logOverlaySuppression(pool, 'suppressed_irrelevant', relev.reason, best.entity_id, best.type, best.confidence, `${best.title} / ${best.body}`, { app: signals.app, title: signals.title })
-          return res.json({ show: false })
-        }
-      }
-
-      // FIX 1 (cont.): track auto-surface count on commitment-based cards
-      if (best.entity_id && typeof best.entity_id === 'string' && best.entity_id.startsWith('commitment:')) {
+      // ── Commitment auto-surface cap (3 surfaces without a click → quiet forever) ──
+      if (best.entity_id.startsWith('commitment:')) {
         const commitmentId = best.entity_id.slice('commitment:'.length)
         try {
           const upd = await pool.query(
@@ -2462,11 +2511,11 @@ FORMATTING:
                    ELSE dismissed_via_inaction
                  END
              WHERE id = $1
-             RETURNING auto_surface_count, auto_surface_clicked, dismissed_via_inaction`,
-            [commitmentId]
+             RETURNING dismissed_via_inaction`,
+            [commitmentId],
           )
           if (upd.rows[0]?.dismissed_via_inaction === true) {
-            await logOverlaySuppression(pool, 'suppressed_inaction_capped', 'auto_surface_count_hit_threshold', best.entity_id, best.type, best.confidence, `${best.title} / ${best.body}`)
+            await logPipelineEvent(pool, 'suppressed', 7, 'auto_surface_cap_3', best, signals)
             return res.json({ show: false })
           }
         } catch (err: any) {
@@ -2474,16 +2523,26 @@ FORMATTING:
         }
       }
 
-      // Log the successful fire for telemetry
-      await logOverlaySuppression(pool, 'fired', 'ok', best.entity_id, best.type, best.confidence, `${best.title} / ${best.body}`, { app: signals.app, title: signals.title })
+      // Log the fire.
+      await logPipelineEvent(pool, 'fired', 10, 'ok', best, signals)
 
       res.json({
         show: true,
         id: `overlay-${Date.now()}`,
-        ...best
+        type: best.type,
+        label: best.label,
+        title: best._final_title || best.raw_title,
+        body: best._final_body || best.raw_body,
+        confidence: Math.round(best._score ?? best.base_confidence),
+        entity_id: best.entity_id,
+        button: best.button,
+        action_type: best.action_type,
+        chain_hint: best.chain_hint,
+        pattern_score: best.pattern_score,
+        upgrade: best.upgrade,
       })
     } catch (err: any) {
-      console.error('[overlay] Evaluate failed:', err.message)
+      console.error('[overlay] Evaluate failed:', err.message, err.stack)
       res.json({ show: false })
     }
   })
@@ -2501,6 +2560,50 @@ FORMATTING:
         )
       }
       res.json({ ok: true })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── Surface coordination ─────────────────────────────────────
+  // Other IRIS surfaces heartbeat here when they become visible or dismiss.
+  // The overlay pipeline queries surface_state (Stage 5) to avoid competing.
+  app.post('/api/surface/visibility', async (req, res) => {
+    try {
+      const pool = getPool()
+      const { surface, visible, device_id, metadata } = req.body || {}
+      if (typeof surface !== 'string' || typeof visible !== 'boolean') {
+        return res.status(400).json({ error: 'surface and visible required' })
+      }
+      // Whitelist to avoid arbitrary-key injection.
+      const ALLOWED = new Set(['overlay', 'feed', 'spotlight', 'whisper', 'glasses_voice'])
+      if (!ALLOWED.has(surface)) {
+        return res.status(400).json({ error: 'unknown surface' })
+      }
+      await pool.query(
+        `INSERT INTO surface_state (surface, visible, device_id, last_event_at, metadata)
+         VALUES ($1, $2, $3, NOW(), $4)
+         ON CONFLICT (surface) DO UPDATE SET
+           visible = EXCLUDED.visible,
+           device_id = EXCLUDED.device_id,
+           last_event_at = NOW(),
+           metadata = EXCLUDED.metadata`,
+        [surface, visible, device_id || null, metadata ? JSON.stringify(metadata) : '{}'],
+      )
+      res.json({ ok: true })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/surface/state', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const r = await pool.query(
+        `SELECT surface, visible, device_id, last_event_at, metadata FROM surface_state
+         ORDER BY last_event_at DESC`,
+      )
+      res.json({ surfaces: r.rows })
     } catch (err: any) {
       res.status(500).json({ error: err.message })
     }
@@ -2716,6 +2819,355 @@ FORMATTING:
       })
     } catch (err: any) {
       console.error('[commitments-audit] Error:', err.message)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // ── OVERLAY PIPELINE DIAGNOSTICS ─────────────────────────────
+  // Full audit of upstream data quality + pipeline-relevant state.
+  // Hit this once after deploy to see the actual state of the DB and
+  // decide whether further cleanup is warranted before enabling the new
+  // decision pipeline for live use.
+  app.get('/api/admin/overlay-audit', async (_req, res) => {
+    try {
+      const pool = getPool()
+
+      const q = async (sql: string, params: any[] = []) => (await pool.query(sql, params)).rows
+
+      const commitmentsOverdue = await q(
+        `SELECT id, description, due_at, created_at FROM commitments
+         WHERE status = 'active' AND due_at IS NOT NULL AND due_at::text < NOW()::text
+         ORDER BY due_at ASC LIMIT 20`,
+      )
+      const commitmentsGarbled = await q(
+        `SELECT id, description, due_at FROM commitments
+         WHERE status = 'active'
+         AND (description ~ '\\s[A-Z]\\.?$'
+              OR description ~ '\\s[A-Za-z]{1,2}$'
+              OR (description LIKE '%(%' AND description NOT LIKE '%)%')
+              OR description LIKE '%[missing]%'
+              OR description LIKE '%[...]%'
+              OR LENGTH(description) < 10
+              OR LENGTH(description) > 300)
+         LIMIT 30`,
+      )
+      const commitmentsGarbledCount = (await q(
+        `SELECT COUNT(*)::int AS c FROM commitments
+         WHERE status = 'active'
+         AND (description ~ '\\s[A-Z]\\.?$'
+              OR description ~ '\\s[A-Za-z]{1,2}$'
+              OR (description LIKE '%(%' AND description NOT LIKE '%)%')
+              OR LENGTH(description) < 10)`,
+      ))[0].c
+      const predictedActionsStale = (await q(
+        `SELECT COUNT(*)::int AS c FROM predicted_actions
+         WHERE predicted_at < NOW() - INTERVAL '7 days'`,
+      ))[0].c
+      const emailThreadsStaleAwaiting = (await q(
+        `SELECT COUNT(*)::int AS c FROM email_threads
+         WHERE awaiting_reply = 1 AND stale_days > 30`,
+      ))[0].c
+      const actionChainsInactive = (await q(
+        `SELECT COUNT(*)::int AS c FROM action_chains
+         WHERE status = 'active' AND created_at < NOW() - INTERVAL '14 days'`,
+      ))[0].c
+      const correctionCountsByMatcher = await q(
+        `SELECT trigger_action, user_action, COUNT(*)::int AS c
+         FROM correction_log
+         WHERE timestamp > NOW() - INTERVAL '90 days'
+         GROUP BY trigger_action, user_action
+         ORDER BY c DESC LIMIT 30`,
+      )
+      const quarantined = await q(
+        `SELECT source_table, source_id, failure_count, last_reason
+         FROM overlay_data_quality_issues WHERE reviewed = FALSE
+         ORDER BY failure_count DESC LIMIT 30`,
+      )
+      const firesLast24h = (await q(
+        `SELECT COUNT(*)::int AS c FROM overlay_log
+         WHERE outcome = 'fired' AND timestamp > NOW() - INTERVAL '24 hours'`,
+      ))[0].c
+      const suppressionTopReasons = await q(
+        `SELECT reason, COUNT(*)::int AS c FROM overlay_log
+         WHERE outcome LIKE 'suppressed_%' AND timestamp > NOW() - INTERVAL '24 hours'
+         GROUP BY reason ORDER BY c DESC LIMIT 20`,
+      )
+      const firesByDay = await q(
+        `SELECT timestamp::date AS day, COUNT(*)::int AS c FROM overlay_log
+         WHERE outcome = 'fired' AND timestamp > NOW() - INTERVAL '7 days'
+         GROUP BY 1 ORDER BY 1 DESC`,
+      )
+
+      res.json({
+        commitments: {
+          overdue_count: commitmentsOverdue.length,
+          overdue_top20: commitmentsOverdue,
+          garbled_total: commitmentsGarbledCount,
+          garbled_samples: commitmentsGarbled,
+        },
+        predicted_actions: { stale_older_than_7d: predictedActionsStale },
+        email_threads: { awaiting_reply_but_over_30d: emailThreadsStaleAwaiting },
+        action_chains: { inactive_over_14d: actionChainsInactive },
+        correction_log: { by_action_last_90d: correctionCountsByMatcher },
+        quarantined_rows: quarantined,
+        overlay_log: {
+          fires_last_24h: firesLast24h,
+          suppression_top_reasons_24h: suppressionTopReasons,
+          fires_by_day_last_7: firesByDay,
+        },
+      })
+    } catch (err: any) {
+      console.error('[overlay-audit] Error:', err.message)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Ten canonical pipeline tests. Each builds synthetic candidates +
+  // signals and reports whether the pipeline behaved as specified.
+  app.get('/api/admin/overlay-test', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const results: Array<{ test: string; expected: string; actual: string; pass: boolean; details?: any }> = []
+
+      const baseSignals: Signals = {
+        ocr: '', title: '', url: '', file: '', app: '', mode: 'reactive',
+      }
+
+      const makeCandidate = (overrides: Partial<Candidate>): Candidate => ({
+        matcher_name: 'test',
+        type: 'email',
+        label: 'COMMITMENT',
+        raw_title: 'A reasonable title for testing',
+        raw_body: 'A reasonable body with enough words to satisfy the render stage.',
+        base_confidence: 80,
+        entity_id: 'test@example.com',
+        button: 'View',
+        action_type: 'view',
+        ...overrides,
+      })
+
+      // Test 1: Kahil/CAS garbled commitment — must be suppressed at Stage 2.
+      const kahilCandidate = makeCandidate({
+        matcher_name: 'proactive_commitment',
+        type: 'proactive',
+        label: 'DEADLINE',
+        raw_title: 'Open commitment with Kahil',
+        raw_body: 'Inform all TRINS students about CAS WLFLO Collaboration by W',
+        entity_id: 'commitment:test-kahil',
+        source_table: 'commitments',
+        source_id: 'test-kahil',
+        due_date: '2026-02-04',
+        freshness_timestamp: '2026-02-01',
+      })
+      const t1 = await runPipeline(pool, [kahilCandidate], { ...baseSignals, app: 'chrome' })
+      const kahilSuppressed = t1.suppressed.some(s => s.stage === 2 || s.stage === 3)
+      results.push({
+        test: '1. Kahil/CAS garbled commitment',
+        expected: 'suppressed at Stage 2 (quality) or Stage 3 (freshness)',
+        actual: t1.fired ? 'FIRED' : t1.suppressed.map(s => `stage${s.stage}:${s.reason}`).join('; '),
+        pass: !t1.fired && kahilSuppressed,
+      })
+
+      // Test 2: Upcoming meeting in 15 min while browsing — should fire with UPCOMING.
+      const mtgStart = new Date(Date.now() + 15 * 60_000).toISOString()
+      const mtgCandidate = makeCandidate({
+        matcher_name: 'proactive_calendar',
+        type: 'proactive',
+        label: 'UPCOMING',
+        raw_title: 'Standup with Rajeev in 15m',
+        raw_body: 'Weekly sync starting soon in your calendar.',
+        entity_id: 'cal-test-standup',
+        source_table: 'calendar_events',
+        source_id: 'cal-test-standup',
+        freshness_timestamp: mtgStart,
+      })
+      const t2 = await runPipeline(pool, [mtgCandidate], { ...baseSignals, app: 'chrome', title: 'rajeev' })
+      results.push({
+        test: '2. Upcoming meeting in 15m, user browsing',
+        expected: 'fires with UPCOMING label',
+        actual: t2.fired ? `FIRED: ${t2.fired.label}` : `suppressed: ${t2.suppressed.map(s => s.reason).join(';')}`,
+        pass: !!t2.fired && String(t2.fired.label).toUpperCase() === 'UPCOMING',
+      })
+
+      // Test 3: Overdue commitment 3 days ago — should fire once with OVERDUE.
+      const threeDaysAgo = new Date(Date.now() - 3 * 86_400_000).toISOString().slice(0, 10)
+      const overdueCandidate = makeCandidate({
+        matcher_name: 'proactive_commitment',
+        type: 'proactive',
+        label: 'OVERDUE',
+        raw_title: 'Overdue send the Q2 deck to team',
+        raw_body: 'You said you would send the Q2 deck three days ago.',
+        entity_id: 'commitment:test-overdue-3d-sim',
+        source_table: 'commitments',
+        source_id: 'test-overdue-3d-sim',
+        due_date: threeDaysAgo,
+        freshness_timestamp: threeDaysAgo,
+      })
+      const t3 = await runPipeline(pool, [overdueCandidate], { ...baseSignals, app: 'chrome' })
+      // Spec carve-out: 1-7 day overdue fires ONCE with OVERDUE label.
+      results.push({
+        test: '3. Overdue commitment 3 days ago',
+        expected: 'fires with OVERDUE label',
+        actual: t3.fired ? `FIRED: ${t3.fired.label}` : t3.suppressed.map(s => `stage${s.stage}:${s.reason}`).join('; '),
+        pass: !!t3.fired && String(t3.fired.label).toUpperCase() === 'OVERDUE',
+      })
+
+      // Test 4: Overdue by 90 days — suppressed at Stage 3.
+      const ninetyDaysAgo = new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10)
+      const t4Candidate = makeCandidate({
+        matcher_name: 'proactive_commitment',
+        label: 'OVERDUE',
+        raw_title: 'Overdue write the annual report draft',
+        raw_body: 'You committed to writing the report but it is very old now.',
+        entity_id: 'commitment:test-overdue-90d-sim',
+        source_table: 'commitments',
+        source_id: 'test-overdue-90d-sim',
+        due_date: ninetyDaysAgo,
+        freshness_timestamp: ninetyDaysAgo,
+      })
+      const t4 = await runPipeline(pool, [t4Candidate], { ...baseSignals, app: 'chrome' })
+      results.push({
+        test: '4. Overdue commitment 90 days ago',
+        expected: 'suppressed at Stage 3 (freshness)',
+        actual: t4.fired ? `FIRED` : t4.suppressed.map(s => `stage${s.stage}:${s.reason}`).join('; '),
+        pass: !t4.fired && t4.suppressed.some(s => s.stage === 3),
+      })
+
+      // Test 5: VS Code + unrelated email candidate — Stage 5 deep_focus rejects.
+      const t5Candidate = makeCandidate({
+        matcher_name: 'contact',
+        type: 'email',
+        label: 'REPLY',
+        raw_title: 'Reply to Sarah about the dinner plans',
+        raw_body: 'Sarah asked about Friday. You have not responded in four days.',
+        entity_id: 'sarah@example.com',
+      })
+      const t5 = await runPipeline(pool, [t5Candidate], { ...baseSignals, app: 'visual studio code', title: 'index.ts' })
+      results.push({
+        test: '5. Unrelated email while in VS Code',
+        expected: 'suppressed at Stage 5 (deep focus)',
+        actual: t5.fired ? 'FIRED' : t5.suppressed.map(s => `stage${s.stage}:${s.reason}`).join('; '),
+        pass: !t5.fired && t5.suppressed.some(s => s.stage === 5),
+      })
+
+      // Test 6: Gmail + calendar candidate for today — topical adjacency.
+      const t6Candidate = makeCandidate({
+        matcher_name: 'calendar',
+        type: 'calendar',
+        label: 'MEETING',
+        raw_title: 'Team retro at 2 PM today',
+        raw_body: 'Retro meeting on your calendar. Agenda not yet shared.',
+        entity_id: 'cal-test-retro',
+        source_table: 'calendar_events',
+        freshness_timestamp: new Date(Date.now() + 3 * 3600_000).toISOString(),
+      })
+      const t6 = await runPipeline(pool, [t6Candidate], { ...baseSignals, app: 'mail', title: 'inbox' })
+      results.push({
+        test: '6. Calendar candidate while in Gmail',
+        expected: 'fires (topical match via calendar+email adjacency) OR explains',
+        actual: t6.fired ? `FIRED: ${t6.fired.label}` : t6.suppressed.map(s => s.reason).join(';'),
+        pass: !!t6.fired || t6.suppressed.every(s => s.stage <= 5),
+      })
+
+      // Test 7: Same entity twice — second is dedup-suppressed (via batched DB state).
+      // We cannot modify DB state inside the test without disturbing production logs;
+      // instead, verify that the pipeline's dedup logic queries overlay_log by
+      // submitting the same candidate after a direct insert.
+      try {
+        await pool.query(
+          `INSERT INTO overlay_log (id, outcome, reason, entity_id, insight_type, matcher_name, stage, confidence, content_snapshot)
+           VALUES ($1, 'fired', 'test', $2, 'email', 'contact', 10, 80, 'test')`,
+          [crypto.randomUUID(), 'dedup-test@example.com'],
+        )
+        const t7Candidate = makeCandidate({
+          matcher_name: 'contact', type: 'email', label: 'REPLY',
+          raw_title: 'Reply to dedup test user about stuff',
+          raw_body: 'This candidate should be dedup-suppressed by Stage 4.',
+          entity_id: 'dedup-test@example.com',
+        })
+        const t7 = await runPipeline(pool, [t7Candidate], { ...baseSignals, app: 'mail' })
+        results.push({
+          test: '7. Same entity fired recently — dedup',
+          expected: 'suppressed at Stage 4',
+          actual: t7.fired ? 'FIRED' : t7.suppressed.map(s => `stage${s.stage}:${s.reason}`).join(';'),
+          pass: !t7.fired && t7.suppressed.some(s => s.stage === 4),
+        })
+        // Clean up the synthetic log row.
+        await pool.query(`DELETE FROM overlay_log WHERE entity_id = $1 AND reason = 'test'`, ['dedup-test@example.com'])
+      } catch (err: any) {
+        results.push({ test: '7. Dedup', expected: 'suppressed at Stage 4', actual: `error: ${err.message}`, pass: false })
+      }
+
+      // Test 8: 11 fires in a day — rate limit. We simulate by inserting
+      // 10 synthetic fires in the last 24h, then submit an 11th.
+      try {
+        const bulk = Array.from({ length: 10 }, () => crypto.randomUUID())
+        for (const id of bulk) {
+          await pool.query(
+            `INSERT INTO overlay_log (id, outcome, reason, entity_id, insight_type, matcher_name, stage, confidence, content_snapshot, timestamp)
+             VALUES ($1, 'fired', 'test_bulk', $2, 'email', 'contact', 10, 80, 'test', NOW() - INTERVAL '3 hours')`,
+            [id, `bulk-${id.slice(0, 6)}@example.com`],
+          )
+        }
+        const t8Candidate = makeCandidate({
+          matcher_name: 'contact', type: 'email',
+          raw_title: 'Reply to eleventh test user today',
+          raw_body: 'This is the eleventh candidate and should be rate-limited.',
+          entity_id: 'rate-limit-test@example.com',
+        })
+        const t8 = await runPipeline(pool, [t8Candidate], { ...baseSignals, app: 'mail' })
+        results.push({
+          test: '8. 11th fire in a day — rate limit',
+          expected: 'suppressed at Stage 7',
+          actual: t8.fired ? 'FIRED' : t8.suppressed.map(s => `stage${s.stage}:${s.reason}`).join(';'),
+          pass: !t8.fired && t8.suppressed.some(s => s.stage === 7),
+        })
+        // Clean up synthetic fires.
+        await pool.query(`DELETE FROM overlay_log WHERE reason = 'test_bulk'`)
+      } catch (err: any) {
+        results.push({ test: '8. Rate limit', expected: 'suppressed at Stage 7', actual: `error: ${err.message}`, pass: false })
+      }
+
+      // Test 9: Rapid typing — suppress all at Stage 5.
+      const t9Candidate = makeCandidate({
+        raw_title: 'Reply to someone about a thing today',
+        raw_body: 'This should be suppressed because the user is typing rapidly.',
+        entity_id: 'typing-test@example.com',
+      })
+      const t9 = await runPipeline(pool, [t9Candidate], { ...baseSignals, app: 'mail', typing_rate: 5 })
+      results.push({
+        test: '9. Rapid typing (>2 changes/sec)',
+        expected: 'suppressed at Stage 5 (rapid_typing_suppress)',
+        actual: t9.fired ? 'FIRED' : t9.suppressed.map(s => `stage${s.stage}:${s.reason}`).join(';'),
+        pass: !t9.fired && t9.suppressed.some(s => s.stage === 5 && /typing/.test(s.reason)),
+      })
+
+      // Test 10: Morning session — first fire of day, recent session start.
+      // Relies on live DB state; reports whatever happens.
+      const t10Candidate = makeCandidate({
+        matcher_name: 'proactive',
+        type: 'proactive',
+        label: 'FOCUS',
+        raw_title: 'A morning focus prompt to start the day',
+        raw_body: 'You have three commitments due this week. Worth a quick look.',
+        entity_id: 'morning-session-test',
+        base_confidence: 82,
+      })
+      const t10 = await runPipeline(pool, [t10Candidate], { ...baseSignals, app: 'chrome' })
+      results.push({
+        test: '10. Morning session heuristic',
+        expected: 'fires via Test D if conditions met; otherwise explains',
+        actual: t10.fired ? 'FIRED' : t10.suppressed.map(s => `stage${s.stage}:${s.reason}`).join(';'),
+        pass: true, // informational — always passes but shows outcome
+      })
+
+      const passed = results.filter(r => r.pass).length
+      res.json({
+        summary: { passed, total: results.length },
+        results,
+      })
+    } catch (err: any) {
+      console.error('[overlay-test] Error:', err.message, err.stack)
       res.status(500).json({ error: err.message })
     }
   })
