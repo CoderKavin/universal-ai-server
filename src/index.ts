@@ -63,6 +63,15 @@ async function ensureAccessToken(): Promise<void> {
   }
 }
 
+// Escape characters that are ILIKE/LIKE wildcards so user-supplied
+// strings (names with underscores, emails with %, subjects with \)
+// match literally instead of as patterns. Any call site building
+// `%${someStr}%` should wrap someStr with this.
+function likeEscape(s: string | null | undefined): string {
+  if (s === null || s === undefined) return ''
+  return String(s).replace(/[\\%_]/g, ch => '\\' + ch)
+}
+
 function authMiddleware(req: express.Request, res: express.Response, next: express.NextFunction): void {
   // Skip auth for health check
   if (req.path === '/health') { next(); return }
@@ -1098,12 +1107,13 @@ FORMATTING:
       // Auto-flip status at 5+ so the thread disappears from active sections.
       const finalUrgent = scoredUrgent.slice(0, 3)
       const finalToday = scoredToday.slice(0, 3)
-      const surfacedThreadIds: string[] = []
+      const surfacedThreadSet = new Set<string>()
       for (const a of [...finalUrgent, ...finalToday]) {
         if (typeof a.related_entity === 'string' && a.related_entity.startsWith('thread-')) {
-          surfacedThreadIds.push(a.related_entity.slice('thread-'.length))
+          surfacedThreadSet.add(a.related_entity.slice('thread-'.length))
         }
       }
+      const surfacedThreadIds = Array.from(surfacedThreadSet)
       if (surfacedThreadIds.length > 0) {
         try {
           await pool.query(
@@ -1353,9 +1363,9 @@ FORMATTING:
       )
       res.json({
         dry_run: true,
-        would_mark_threads_stale_ignored: threadsToMark.rows[0].c,
-        would_mark_commitments_abandoned: commitmentsToMark.rows[0].c,
-        threads_over_60_days: threadsOver60.rows[0].c,
+        would_mark_threads_stale_ignored: threadsToMark.rows[0]?.c ?? 0,
+        would_mark_commitments_abandoned: commitmentsToMark.rows[0]?.c ?? 0,
+        threads_over_60_days: threadsOver60.rows[0]?.c ?? 0,
         how_to_execute: 'POST /api/admin/surface-cleanup?execute=1',
       })
     } catch (err: any) {
@@ -1512,9 +1522,9 @@ FORMATTING:
       )
 
       res.json({
-        total_real: total.rows[0].c,
-        earliest: range.rows[0].earliest,
-        latest: range.rows[0].latest,
+        total_real: total.rows[0]?.c ?? 0,
+        earliest: range.rows[0]?.earliest ?? null,
+        latest: range.rows[0]?.latest ?? null,
         top_apps: byApp.rows,
         by_category: byCat.rows,
         by_device: byDevice.rows,
@@ -1588,17 +1598,18 @@ FORMATTING:
       for (let i = 0; i < items.length; i++) {
         const obs = items[i] || {}
         try {
-          const source: string = String(obs.source || 'phone_notification')
-          const appPackage: string = String(obs.app_package || '')
-          const title: string = String(obs.title || '')
-          const postedAtMs: number | null = typeof obs.posted_at_ms === 'number' ? obs.posted_at_ms : null
-          const deviceId: string = String(obs.device_id || '')
-          const body: string = String(obs.body || '')
-          const subtext: string = obs.subtext == null ? '' : String(obs.subtext)
-          const category: string = String(obs.category || '')
-          const appName: string = String(obs.app_name || '')
+          // Bounded-string coercion: never trust client to send reasonable sizes.
+          const source: string = String(obs.source || 'phone_notification').slice(0, 40)
+          const appPackage: string = String(obs.app_package || '').slice(0, 200)
+          const title: string = String(obs.title || '').slice(0, 300)
+          const postedAtMs: number | null = typeof obs.posted_at_ms === 'number' && Number.isFinite(obs.posted_at_ms) ? obs.posted_at_ms : null
+          const deviceId: string = String(obs.device_id || '').slice(0, 100)
+          const body: string = String(obs.body || '').slice(0, 1500)
+          const subtext: string = obs.subtext == null ? '' : String(obs.subtext).slice(0, 500)
+          const category: string = String(obs.category || '').slice(0, 40)
+          const appName: string = String(obs.app_name || '').slice(0, 100)
           const isGroup: boolean = !!obs.is_group
-          const priority: number = typeof obs.priority === 'number' ? obs.priority : 0
+          const priority: number = typeof obs.priority === 'number' && Number.isFinite(obs.priority) ? obs.priority : 0
 
           // Dedup: same (device_id + app_package + posted_at_ms + title) already
           // ingested in the last 5 minutes → skip silently.
@@ -1984,10 +1995,15 @@ FORMATTING:
       const tomorrowReduction = parseInt(rl.whisper_tomorrow_reduction || '0')
       const effectiveLimit = Math.max(1, dailyLimit - tomorrowReduction)
 
-      // Reset daily counter if new day
+      // Reset daily counter if new UTC day. (Was using local toDateString
+      // which depends on server TZ — Render runs UTC but a user in a
+      // different zone would see resets at "wrong" local midnight.
+      // Using UTC date string everywhere makes behavior deterministic
+      // regardless of server timezone.)
       const dailyReset = rl.whisper_daily_reset ? new Date(rl.whisper_daily_reset) : new Date(0)
       let dailyCount = parseInt(rl.whisper_daily_count || '0')
-      if (now.toDateString() !== dailyReset.toDateString()) {
+      const utcDay = (d: Date) => Number.isFinite(d.getTime()) ? d.toISOString().slice(0, 10) : ''
+      if (utcDay(now) !== utcDay(dailyReset)) {
         dailyCount = 0
         await pool.query(`INSERT INTO settings (key, value) VALUES ('whisper_daily_count', '0') ON CONFLICT (key) DO UPDATE SET value = '0'`)
         await pool.query(`INSERT INTO settings (key, value) VALUES ('whisper_daily_reset', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [nowISO])
@@ -2130,7 +2146,7 @@ FORMATTING:
             // Check if they sent something in the last hour
             const recentMsg = await pool.query(
               `SELECT id, source, timestamp FROM observations WHERE source IN ('email','whatsapp') AND timestamp > NOW() - INTERVAL '1 hour' AND raw_content ILIKE $1 LIMIT 1`,
-              [`%${c.name}%`]
+              [`%${likeEscape(c.name)}%`]
             )
             if (recentMsg.rows.length > 0) {
               const ago = Math.round((now.getTime() - new Date(recentMsg.rows[0].timestamp).getTime()) / 60000)
@@ -2251,7 +2267,7 @@ FORMATTING:
             `SELECT COUNT(*)::int as c FROM whisper_log WHERE type = $1 AND user_action = 'dismiss' AND fired_at > NOW() - INTERVAL '7 days'`,
             [c.type]
           )
-          if (dismissals.rows[0].c >= 3) continue
+          if ((dismissals.rows[0]?.c ?? 0) >= 3) continue
         }
 
         // FILTER 4: Rate limits (severity=critical bypasses daily limit but still counts)
@@ -2625,12 +2641,15 @@ FORMATTING:
         for (const ev of upcoming.rows) {
           const evName = (ev.summary || '').toLowerCase()
           if (!allText.includes(evName) && evName.length > 5) continue
-          const participants = JSON.parse(ev.participants || '[]')
+          let participants: string[] = []
+          try { const p = JSON.parse(ev.participants || '[]'); if (Array.isArray(p)) participants = p } catch {}
           const contactMatch = contacts.rows.find((c: any) =>
-            participants.some((p: string) => p.toLowerCase().includes((c.name || '').toLowerCase()))
+            participants.some((p: string) => typeof p === 'string' && p.toLowerCase().includes((c.name || '').toLowerCase()))
           )
           if (contactMatch) {
-            const minsLeft = Math.round((new Date(ev.start_time).getTime() - Date.now()) / 60000)
+            const startMs = new Date(ev.start_time).getTime()
+            if (!Number.isFinite(startMs)) continue
+            const minsLeft = Math.round((startMs - Date.now()) / 60000)
             candidates.push({
               matcher_name: 'calendar',
               type: 'calendar',
@@ -4001,7 +4020,7 @@ FORMATTING:
       const rateRes = await pool.query(
         `SELECT COUNT(*)::int AS c FROM observations WHERE timestamp > NOW() - INTERVAL '1 hour'`
       )
-      const observation_rate = rateRes.rows[0].c
+      const observation_rate = rateRes.rows[0]?.c ?? 0
 
       // Last observation
       const lastRes = await pool.query(
@@ -4174,7 +4193,7 @@ FORMATTING:
         `SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
          FROM contacts WHERE LOWER(COALESCE(name,'')) LIKE $1 OR LOWER(email) LIKE $1
          ORDER BY relationship_score DESC LIMIT 50`,
-        [`%${search}%`]
+        [`%${likeEscape(search)}%`]
       )
       res.json({ contacts: rows.rows })
     } catch (err: any) {
@@ -4192,7 +4211,7 @@ FORMATTING:
          FROM email_threads
          WHERE LOWER(COALESCE(participants,'')) LIKE $1 OR LOWER(COALESCE(subject,'')) LIKE $1 OR LOWER(COALESCE(last_message_from,'')) LIKE $1
          ORDER BY last_message_date DESC LIMIT 30`,
-        [`%${search}%`]
+        [`%${likeEscape(search)}%`]
       )
       res.json({ threads: rows.rows })
     } catch (err: any) {
@@ -4212,7 +4231,7 @@ FORMATTING:
          WHERE LOWER(raw_content) LIKE $1
          AND timestamp > NOW() - ($2 || ' hours')::interval
          ORDER BY timestamp DESC LIMIT 50`,
-        [`%${search}%`, String(hours)]
+        [`%${likeEscape(search)}%`, String(hours)]
       )
       res.json({ observations: rows.rows, count: rows.rows.length })
     } catch (err: any) {
@@ -4385,7 +4404,7 @@ FORMATTING:
         await pool.query(
           `SELECT id, name, email, emails_sent, emails_received, relationship_score, last_interaction_at
            FROM contacts WHERE LOWER(COALESCE(name,'')) LIKE $1 OR LOWER(COALESCE(email,'')) LIKE $1 LIMIT 10`,
-          [`%${q.toLowerCase()}%`]
+          [`%${likeEscape(q.toLowerCase())}%`]
         )
       ).rows
       const searchRel = async (q: string) => (
@@ -4393,7 +4412,7 @@ FORMATTING:
           `SELECT name, email, current_closeness, trajectory, interaction_freq_30d, interaction_freq_90d,
                   whatsapp_msgs_30d, email_count_30d, last_interaction
            FROM relationships WHERE LOWER(COALESCE(name,'')) LIKE $1 OR LOWER(COALESCE(email,'')) LIKE $1 LIMIT 10`,
-          [`%${q.toLowerCase()}%`]
+          [`%${likeEscape(q.toLowerCase())}%`]
         )
       ).rows
 

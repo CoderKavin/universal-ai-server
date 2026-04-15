@@ -671,6 +671,12 @@ function topicMatches(
 
 async function anyOtherSurfaceVisible(pool: Pool): Promise<{ busy: boolean; which: string }> {
   try {
+    // Server-side clear of stale heartbeats (client crash leaves visible=TRUE forever).
+    await pool.query(
+      `UPDATE surface_state SET visible = FALSE
+       WHERE visible = TRUE AND last_event_at < NOW() - INTERVAL '2 minutes'`,
+    ).catch(() => {})
+
     const r = await pool.query(
       `SELECT surface FROM surface_state
        WHERE visible = TRUE
@@ -678,7 +684,9 @@ async function anyOtherSurfaceVisible(pool: Pool): Promise<{ busy: boolean; whic
          AND last_event_at > NOW() - INTERVAL '30 seconds'
        LIMIT 1`,
     )
-    if (r.rows[0]) return { busy: true, which: r.rows[0].surface }
+    if (r.rows.length > 0 && r.rows[0]?.surface) {
+      return { busy: true, which: String(r.rows[0].surface) }
+    }
   } catch {}
   return { busy: false, which: '' }
 }

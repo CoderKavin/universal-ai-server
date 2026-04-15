@@ -420,7 +420,9 @@ export async function upsertInsight(statement: string, evidence: string[], confi
   const existing = await pool.query("SELECT id, confidence, times_confirmed, evidence FROM insights WHERE status='active' AND LOWER(SUBSTRING(statement,1,60))=$1", [key])
   if (existing.rows.length > 0) {
     const e = existing.rows[0]
-    const merged = [...new Set([...JSON.parse(e.evidence || '[]'), ...evidence])]
+    let existingEv: string[] = []
+    try { const p = JSON.parse(e.evidence || '[]'); if (Array.isArray(p)) existingEv = p } catch {}
+    const merged = [...new Set([...existingEv, ...evidence])]
     const newConf = Math.min(1.0, e.confidence + 0.05 * evidence.length)
     await pool.query('UPDATE insights SET confidence=$1, evidence=$2, times_confirmed=times_confirmed+1, last_confirmed=NOW(), source_count=GREATEST(source_count,$3) WHERE id=$4', [newConf, JSON.stringify(merged), sourceCount, e.id])
     return e.id

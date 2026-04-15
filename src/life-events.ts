@@ -267,7 +267,7 @@ export async function analyzeForLifeEvent(
         "SELECT COUNT(*)::int as c FROM observations WHERE source='wifi' AND raw_content=$1 AND timestamp < NOW() - INTERVAL '7 days'",
         [network]
       )
-      if (existing.rows[0].c === 0) {
+      if ((existing.rows[0]?.c ?? 0) === 0) {
         return createLifeEvent('location_change', `New location detected: connected to "${network}" 3+ times (new network)`, 0.60, evidence)
       }
     }
@@ -335,7 +335,7 @@ async function checkCorroboration(content: string, timestamp: string): Promise<b
       "SELECT COUNT(*)::int as c FROM observations WHERE timestamp >= $1 AND raw_content ILIKE $2 AND source != 'life_event'",
       [cutoff, `%${keyword}%`]
     )
-    if (result.rows[0].c >= 2) return true // keyword appears in 2+ other observations
+    if ((result.rows[0]?.c ?? 0) >= 2) return true // keyword appears in 2+ other observations
   }
   return false
 }
