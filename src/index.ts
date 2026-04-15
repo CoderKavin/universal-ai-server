@@ -381,46 +381,77 @@ FORMATTING:
       // Set SSE headers
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
+        'Cache-Control': 'no-cache, no-transform',
         'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no' // Disable nginx/render buffering
+        'X-Accel-Buffering': 'no'         // disable nginx / Render proxy buffering
       })
-      // Send initial ping to confirm connection
+      // Flush headers immediately — Render's proxy sometimes buffers until
+      // the first real write lands on the wire.
+      if (typeof (res as any).flushHeaders === 'function') (res as any).flushHeaders()
+
+      // Send initial ping to confirm connection + push it past any buffer.
       res.write(`data: ${JSON.stringify({ type: 'ping' })}\n\n`)
 
-      // Stream from Claude using the async iterator API
+      // ── Real streaming from Claude ──────────────────────────────
+      // Previously: non-streaming call + simulated chunking, which made
+      // the user wait for the full Claude latency (~3-8s) before ANY
+      // token showed. Real streaming lets tokens hit the client as they
+      // land. Keep-alive pings every 5s during generation ensure Render
+      // never timeouts or buffers us out.
       let fullText = ''
+      let finishReason: string | null = null
+      let streamError: string | null = null
+
+      const keepAlive = setInterval(() => {
+        try { res.write(`data: ${JSON.stringify({ type: 'ping' })}\n\n`) } catch {}
+      }, 5000)
+
       try {
         const systemStr = systemBlocks.map((b: any) => b.text).join('\n')
-
-        // Use non-streaming Claude call, but write result immediately
-        // Streaming through Render's proxy has buffering issues. Instead,
-        // we call Claude normally and stream the RESULT to the client token by token
-        const result = await claudeWithFallback(client, {
+        const stream = await claudeStreamWithFallback(client, {
           model: settings.model || 'claude-sonnet-4-20250514',
           max_tokens: isSpotlight ? 300 : 500,
           system: systemStr,
           messages: [{ role: 'user', content }]
         }, 'spotlight-stream')
 
-        fullText = result.content[0].type === 'text' ? result.content[0].text : ''
-
-        // Stream the response to client character by character (simulated streaming)
-        // This gives the client tokens progressively for the typing animation
-        if (fullText.length > 0) {
-          // Send in chunks of ~10 chars for smooth animation
-          for (let i = 0; i < fullText.length; i += 10) {
-            if (abortController.signal.aborted) break
-            const chunk = fullText.slice(i, i + 10)
-            res.write(`data: ${JSON.stringify({ type: 'text', content: chunk })}\n\n`)
+        for await (const event of stream) {
+          if (abortController.signal.aborted) break
+          if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+            const chunk = event.delta.text || ''
+            if (chunk) {
+              fullText += chunk
+              res.write(`data: ${JSON.stringify({ type: 'text', content: chunk })}\n\n`)
+            }
+          } else if (event.type === 'message_delta') {
+            if (event.delta?.stop_reason) finishReason = event.delta.stop_reason
+          } else if (event.type === 'message_stop') {
+            break
           }
         }
-
-        res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`)
       } catch (err: any) {
-        console.error(`[stream] Error: ${err.message}`)
-        try { res.write(`data: ${JSON.stringify({ type: 'error', content: err.message })}\n\n`) } catch {}
+        streamError = err?.message || String(err)
+        console.error(`[stream] Error: ${streamError}`)
+      } finally {
+        clearInterval(keepAlive)
       }
+
+      // If Claude produced nothing, surface a real error instead of a
+      // silent empty close — the client used to render a generic
+      // "No response." with no way to tell why.
+      if (fullText.length === 0 && !abortController.signal.aborted) {
+        const reason = streamError
+          ? `Claude error: ${streamError.slice(0, 120)}`
+          : (finishReason === 'max_tokens'
+            ? 'Response was cut off before any text generated. Try a shorter question.'
+            : `No text in response (finish_reason=${finishReason || 'unknown'}). Try rephrasing.`)
+        try { res.write(`data: ${JSON.stringify({ type: 'error', content: reason })}\n\n`) } catch {}
+      } else if (streamError) {
+        // Partial response + error at end: send error event with partial text preserved.
+        try { res.write(`data: ${JSON.stringify({ type: 'error', content: `Partial response (error: ${streamError.slice(0, 100)})` })}\n\n`) } catch {}
+      }
+
+      try { res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`) } catch {}
 
       // Post-stream: store in query memory, run second-pass (fire-and-forget)
       if (fullText.length > 0) {
