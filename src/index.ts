@@ -1142,6 +1142,27 @@ FORMATTING:
     res.json({ id })
   })
 
+  // Admin: delete empty phone_notification rows that were written by the
+  // v1 endpoint before it learned to unwrap the { observations: [...] }
+  // envelope. Safe to call multiple times — only touches rows with empty
+  // raw_content AND empty title in extracted_entities.
+  app.post('/api/admin/cleanup-empty-phone-obs', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const r = await pool.query(
+        `DELETE FROM observations
+         WHERE source = 'phone_notification'
+           AND (raw_content IS NULL OR raw_content = '')
+           AND (extracted_entities::jsonb->>'title' IS NULL
+                OR extracted_entities::jsonb->>'title' = '')
+         RETURNING id`,
+      )
+      res.json({ deleted: r.rowCount })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
   // ── POST /api/observations (phone notification batch ingest) ──
   // The phone app queues notification observations locally and flushes
   // them here when it has connectivity. Accepts a single object or an
@@ -1152,10 +1173,27 @@ FORMATTING:
     try {
       const pool = getPool()
       const raw = req.body
-      const items: any[] = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? [raw] : [])
+
+      // Accept three shapes:
+      //   1. a single observation object: { source, app_package, title, ... }
+      //   2. a bare array of observations: [{...}, {...}]
+      //   3. a wrapper object from the phone app's flush: { observations: [...] }
+      // The wrapper case must be detected first because a wrapper is also a
+      // plain object; without this guard it gets treated as a single
+      // observation and silently eats real data.
+      let items: any[]
+      if (Array.isArray(raw)) {
+        items = raw
+      } else if (raw && typeof raw === 'object' && Array.isArray((raw as any).observations)) {
+        items = (raw as any).observations
+      } else if (raw && typeof raw === 'object') {
+        items = [raw]
+      } else {
+        items = []
+      }
 
       if (items.length === 0) {
-        return res.status(400).json({ error: 'body must be an observation object or array' })
+        return res.status(400).json({ error: 'body must be an observation object, array, or { observations: [...] }' })
       }
       if (items.length > 100) {
         return res.status(400).json({ error: 'max 100 observations per call' })
