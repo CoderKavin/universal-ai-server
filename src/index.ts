@@ -1633,6 +1633,88 @@ FORMATTING:
     }
   })
 
+  // Admin: scan chain_steps / action_chains / life_events / predicted_actions
+  // for Hegseth-class contamination (news topics treated as user work).
+  app.get('/api/admin/contamination-scan', async (_req, res) => {
+    try {
+      const pool = getPool()
+
+      // Free-text patterns that show up in news content but not a
+      // personal IB-student's actual work.
+      const newsPatterns = [
+        '%Hegseth%', '%Pentagon%', '%NATO%', '%Ukraine%', '%Russia-Ukraine%',
+        '%Israel%', '%Gaza%', '%Hamas%', '%Putin%', '%Biden%', '%Trump%',
+        '%Harris%', '%GOP%', '%DNC%', '%Supreme Court%', '%SCOTUS%',
+        '%tariff%', '%impeachment%', '%election%', '%stock market%',
+        '%NASDAQ%', '%S&P 500%', '%bitcoin%', '%Fed rate%',
+        '%military leadership%', '%military strike%', '%critical analysis of%',
+      ]
+      const like = newsPatterns.map((_, i) => `t ILIKE $${i + 1}`).join(' OR ')
+
+      const chains = await pool.query(
+        `SELECT ac.id, ac.trigger_event AS t, ac.trigger_type, ac.trigger_entity, ac.created_at,
+                ac.context_snapshot,
+                (SELECT STRING_AGG(cs.title, ' | ' ORDER BY cs.step_number)
+                 FROM chain_steps cs WHERE cs.chain_id = ac.id) AS step_titles
+         FROM action_chains ac
+         WHERE (${like})
+            OR EXISTS (SELECT 1 FROM chain_steps cs
+                       WHERE cs.chain_id = ac.id
+                         AND (${newsPatterns.map((_, i) => `cs.title ILIKE $${i + 1} OR cs.description ILIKE $${i + 1}`).join(' OR ')}))
+         ORDER BY ac.created_at DESC LIMIT 50`,
+        newsPatterns,
+      )
+
+      const steps = await pool.query(
+        `SELECT cs.id, cs.chain_id, cs.title AS t, cs.description, cs.created_at
+         FROM chain_steps cs
+         WHERE (${like}) OR description ILIKE ANY($${newsPatterns.length + 1}::text[])
+         ORDER BY cs.created_at DESC LIMIT 30`,
+        [...newsPatterns, newsPatterns],
+      )
+
+      const predictedActions = await pool.query(
+        `SELECT id, title AS t, description, trigger_context, related_entity, predicted_at, status
+         FROM predicted_actions
+         WHERE (${like}) OR description ILIKE ANY($${newsPatterns.length + 1}::text[])
+            OR trigger_context ILIKE ANY($${newsPatterns.length + 1}::text[])
+         ORDER BY predicted_at DESC LIMIT 30`,
+        [...newsPatterns, newsPatterns],
+      )
+
+      const lifeEvents = await pool.query(
+        `SELECT id, type, summary AS t, confidence, detected_at
+         FROM life_events WHERE (${like})
+         ORDER BY detected_at DESC LIMIT 30`,
+        newsPatterns,
+      )
+
+      // Find the originating observation for Hegseth specifically (or the
+      // first match of any pattern that's in chains).
+      const sourceObs = await pool.query(
+        `SELECT id, timestamp, source, event_type, raw_content,
+                LENGTH(raw_content) AS content_len
+         FROM observations
+         WHERE raw_content ILIKE '%Hegseth%' OR raw_content ILIKE '%military leadership%'
+            OR raw_content ILIKE '%critical analysis%'
+         ORDER BY timestamp ASC LIMIT 10`,
+      )
+
+      res.json({
+        chains: { count: chains.rows.length, samples: chains.rows.slice(0, 10) },
+        chain_steps: { count: steps.rows.length, samples: steps.rows.slice(0, 10) },
+        predicted_actions: { count: predictedActions.rows.length, samples: predictedActions.rows.slice(0, 10) },
+        life_events: { count: lifeEvents.rows.length, samples: lifeEvents.rows.slice(0, 10) },
+        source_observations: { count: sourceObs.rows.length, samples: sourceObs.rows.map((r: any) => ({
+          id: r.id, timestamp: r.timestamp, source: r.source, event_type: r.event_type,
+          content_len: r.content_len, raw_content_snippet: String(r.raw_content || '').slice(0, 300),
+        })) },
+      })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message, stack: err.stack?.slice(0, 400) })
+    }
+  })
+
   // Admin: pure-function test of dismissal-learning matching + scoring.
   // POST { candidate: { entity_id, trigger_context }, corrections: [...] }
   // Returns the matched rows and aggregated score so we can verify the
