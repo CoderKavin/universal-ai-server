@@ -83,6 +83,8 @@ const ALLOWED_LABELS = new Set<string>([
 ])
 
 // Short words that look like truncation stubs but are real English.
+// IB acronyms (IA, EE, HL, SL, IB, TZ) live here too — for an IB student
+// they're normal trailing words, not truncation artifacts.
 const SHORT_WORD_ALLOWLIST = new Set([
   'a', 'A', 'I', 'an', 'An', 'as', 'As', 'at', 'At', 'be', 'Be',
   'by', 'By', 'do', 'Do', 'go', 'Go', 'he', 'He', 'if', 'If',
@@ -90,10 +92,12 @@ const SHORT_WORD_ALLOWLIST = new Set([
   'no', 'No', 'of', 'Of', 'on', 'On', 'or', 'Or', 'so', 'So',
   'to', 'To', 'up', 'Up', 'us', 'Us', 'we', 'We', 'am', 'Am',
   'pm', 'PM', 'PM.',
+  // IB acronyms — legit 2-letter terms common in Kavin's work
+  'IA', 'EE', 'HL', 'SL', 'IB', 'TZ', 'CS',
 ])
 
 // User-specific allowed acronyms (safe to display raw).
-const USER_ACRONYMS = new Set(['EE', 'IB', 'CAS', 'IRIS', 'HL', 'SL', 'TOK', 'EE.'])
+const USER_ACRONYMS = new Set(['EE', 'IB', 'CAS', 'IRIS', 'HL', 'SL', 'TOK', 'EE.', 'IA', 'TRINS', 'WLFLO'])
 
 // Apps that indicate the user is deeply focused — overlay must be extra strict.
 const DEEP_FOCUS_APPS = [
@@ -544,17 +548,18 @@ async function stageRelevance(
     const testA = entityDirectMatch
     // Test B: topical match
     const testB = topicMatch
-    // Test C: strong temporal urgency + neutral context
+    // Test C: strong temporal urgency + neutral context.
+    // Spec carve-out: 1-7 day OVERDUE commitments fire once with OVERDUE
+    // label regardless of direct entity match — the "once" is enforced by
+    // the auto_surface_count cap + per-entity 6h cooldown downstream.
     let testC = false
+    const anyNeutralCtx = isNeutral || isMessaging || isEmail || isCalendar
     if (c.due_date) {
       const msUntil = new Date(c.due_date).getTime() - Date.now()
-      if (msUntil > 0 && msUntil < 2 * 3600_000 && (isNeutral || isMessaging || isEmail || isCalendar)) {
-        testC = true
-      }
+      if (msUntil > 0 && msUntil < 2 * 3600_000 && anyNeutralCtx) testC = true
     }
-    if (c.label === 'UPCOMING' && (isNeutral || isMessaging || isEmail || isCalendar)) {
-      testC = true  // approaching calendar event
-    }
+    if (c.label === 'UPCOMING' && anyNeutralCtx) testC = true
+    if (c.label === 'OVERDUE' && anyNeutralCtx) testC = true
     // Test D: morning session (first 10 min of day, first fire)
     const testD = morningOk
     // Test E: user just switched apps and candidate is topical to the new app
