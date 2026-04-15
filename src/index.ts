@@ -1142,6 +1142,67 @@ FORMATTING:
     res.json({ id })
   })
 
+  // Admin: stats on real phone_notification observations — excludes the
+  // synthetic device_ids used during endpoint verification.
+  app.get('/api/admin/phone-obs-audit', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const excl = ['test_device', 'hotfix_probe']
+
+      const total = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM observations
+         WHERE source = 'phone_notification'
+           AND COALESCE(extracted_entities::jsonb->>'device_id', '') NOT IN ($1, $2)`,
+        excl,
+      )
+      const range = await pool.query(
+        `SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest
+         FROM observations
+         WHERE source = 'phone_notification'
+           AND COALESCE(extracted_entities::jsonb->>'device_id', '') NOT IN ($1, $2)`,
+        excl,
+      )
+      const byApp = await pool.query(
+        `SELECT extracted_entities::jsonb->>'app_package' AS app_package,
+                extracted_entities::jsonb->>'app_name'    AS app_name,
+                COUNT(*)::int AS c
+         FROM observations
+         WHERE source = 'phone_notification'
+           AND COALESCE(extracted_entities::jsonb->>'device_id', '') NOT IN ($1, $2)
+         GROUP BY app_package, app_name
+         ORDER BY c DESC LIMIT 10`,
+        excl,
+      )
+      const byCat = await pool.query(
+        `SELECT event_type, COUNT(*)::int AS c
+         FROM observations
+         WHERE source = 'phone_notification'
+           AND COALESCE(extracted_entities::jsonb->>'device_id', '') NOT IN ($1, $2)
+         GROUP BY event_type ORDER BY c DESC LIMIT 10`,
+        excl,
+      )
+      const byDevice = await pool.query(
+        `SELECT COALESCE(extracted_entities::jsonb->>'device_id','') AS device_id, COUNT(*)::int AS c
+         FROM observations
+         WHERE source = 'phone_notification'
+           AND COALESCE(extracted_entities::jsonb->>'device_id', '') NOT IN ($1, $2)
+         GROUP BY device_id ORDER BY c DESC LIMIT 10`,
+        excl,
+      )
+
+      res.json({
+        total_real: total.rows[0].c,
+        earliest: range.rows[0].earliest,
+        latest: range.rows[0].latest,
+        top_apps: byApp.rows,
+        by_category: byCat.rows,
+        by_device: byDevice.rows,
+      })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
   // Admin: delete empty phone_notification rows that were written by the
   // v1 endpoint before it learned to unwrap the { observations: [...] }
   // envelope. Safe to call multiple times — only touches rows with empty
