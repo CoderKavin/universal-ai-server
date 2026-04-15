@@ -39,7 +39,8 @@ import {
 } from './whisper-pipeline'
 import {
   insertCorrectionWithEntity, loadCorrectionsForCandidate, scoreFromCorrections,
-  significantTokens,
+  significantTokens, matchCorrections as matchCorrectionsExternal,
+  scoreFromCorrections as scoreFromCorrectionsExternal,
 } from './dismissal-learning'
 import {
   initDB, migrate, getPool, getSettings, setSetting,
@@ -1626,6 +1627,37 @@ FORMATTING:
         dry_run: false,
         threads_marked_stale_ignored: tRes.rowCount,
         commitments_marked_abandoned: cRes.rowCount,
+      })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Admin: pure-function test of dismissal-learning matching + scoring.
+  // POST { candidate: { entity_id, trigger_context }, corrections: [...] }
+  // Returns the matched rows and aggregated score so we can verify the
+  // entity-id-first / ≥2-token-overlap rules without seeding production.
+  app.post('/api/admin/dismissal-test', (req, res) => {
+    try {
+      const { candidate, corrections } = req.body || {}
+      if (!candidate || !Array.isArray(corrections)) {
+        return res.status(400).json({ error: 'body must be { candidate, corrections: [] }' })
+      }
+      const matches = matchCorrectionsExternal(corrections, {
+        entity_id: candidate.entity_id ?? null,
+        trigger_context: candidate.trigger_context ?? '',
+      })
+      const score = scoreFromCorrectionsExternal(matches)
+      res.json({
+        matched_count: matches.length,
+        score,
+        matched_rows: matches.map(r => ({
+          entity_id: r.entity_id,
+          trigger_action: r.trigger_action,
+          trigger_context: (r.trigger_context || '').slice(0, 80),
+          user_action: r.user_action,
+          signal_strength: r.signal_strength,
+        })),
       })
     } catch (err: any) {
       res.status(500).json({ error: err.message })
