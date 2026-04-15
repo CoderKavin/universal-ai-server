@@ -17,6 +17,7 @@
 import { getPool } from './db'
 import { getLivingProfile, setLivingProfile, listInsights, insertObservation, getSettings } from './db'
 import crypto from 'crypto'
+import { isAutomatedSender, extractFromHeader } from './whisper-pipeline'
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -128,6 +129,16 @@ export async function analyzeForLifeEvent(
   const skipSources = new Set(['daily_digest', 'weekly_digest', 'trend_detector', 'life_event', 'system'])
   if (skipSources.has(source)) return null
 
+  // Skip automated / marketing email — LinkedIn "X joined a new team"
+  // notifications look like life events but aren't. A user's "new project"
+  // signal comes from them typing about it, not from a newsletter.
+  if (source === 'email') {
+    const fromHeader = extractFromHeader(content)
+    if (fromHeader && isAutomatedSender(fromHeader)) {
+      return null
+    }
+  }
+
   const contentLower = content.toLowerCase()
   const evidence = [{ source, content: content.slice(0, 500), timestamp }]
 
@@ -165,7 +176,8 @@ export async function analyzeForLifeEvent(
         // Require personal context — not a news article or movie quote
         const isPersonal = /\b(?:I|we|my|me|us|our)\b/i.test(content)
         if (isPersonal) {
-          return createLifeEvent('relationship_shift', `Relationship change (${subtype}): ${content.slice(0, 100)}`, 0.70, evidence)
+          const clean = sanitizeLifeEventSummary(content) || subtype
+          return createLifeEvent('relationship_shift', `${subtype} signal: ${clean}`.slice(0, 120), 0.70, evidence)
         }
       }
     }
@@ -177,7 +189,9 @@ export async function analyzeForLifeEvent(
       if (pattern.test(content)) {
         const isPersonal = /\b(?:I|we|my|our|his|her)\b/i.test(content)
         if (isPersonal) {
-          return createLifeEvent('loss', `Loss detected: ${content.slice(0, 120)}`, 0.75, evidence)
+          const clean = sanitizeLifeEventSummary(content)
+          if (!clean) continue
+          return createLifeEvent('loss', clean, 0.75, evidence)
         }
       }
     }
@@ -187,21 +201,31 @@ export async function analyzeForLifeEvent(
   if (source === 'email' || source === 'whatsapp' || source === 'calendar') {
     for (const pattern of MEDICAL_PATTERNS) {
       if (pattern.test(content)) {
-        return createLifeEvent('medical', `Medical event: ${content.slice(0, 120)}`, 0.65, evidence)
+        const clean = sanitizeLifeEventSummary(content)
+        if (!clean) continue
+        return createLifeEvent('medical', clean, 0.65, evidence)
       }
     }
   }
 
-  // 6. New project/role mentions appearing across multiple sources
+  // 6. New project/role mentions — tightened after LinkedIn false positives.
+  // Requires corroboration from at least 2 independent observations AND a
+  // first-person or user-initiated context ("I'm launching", "joined as").
+  // The summary uses a cleaned subject/first-line, never the raw email
+  // blob (which contains "From:" and other technical fields).
   if (source === 'email' || source === 'whatsapp' || source === 'centrum') {
     for (const pattern of NEW_PROJECT_PATTERNS) {
       if (pattern.test(content)) {
-        // Check if this is corroborated by observations in the last 48 hours
-        const corroboration = await checkCorroboration(content, timestamp)
-        const confidence = corroboration ? 0.80 : 0.55
-        if (confidence >= 0.55) {
-          return createLifeEvent('new_project', `New project/role: ${content.slice(0, 120)}`, confidence, evidence)
-        }
+        const isPersonal = /\b(?:I|I'm|I am|I've|we|we're|we are|my|our)\b/.test(content)
+        if (!isPersonal) continue
+
+        const corroborated = await checkCorroboration(content, timestamp)
+        if (!corroborated) continue
+
+        const summary = sanitizeLifeEventSummary(content)
+        if (!summary) continue
+
+        return createLifeEvent('new_project', summary, 0.85, evidence)
       }
     }
   }
@@ -221,7 +245,9 @@ export async function analyzeForLifeEvent(
       if (pattern.test(content)) {
         const isPersonal = /\b(?:I|we|my|our|you)\b/i.test(content)
         if (isPersonal) {
-          return createLifeEvent('achievement', `Achievement: ${content.slice(0, 120)}`, 0.70, evidence)
+          const clean = sanitizeLifeEventSummary(content)
+          if (!clean) continue
+          return createLifeEvent('achievement', clean, 0.70, evidence)
         }
       }
     }
@@ -253,7 +279,8 @@ export async function analyzeForLifeEvent(
     const isRecurring = /\brecurring\b/i.test(content) || /\bevery\b/i.test(content)
     const isNew = eventType === 'created'
     if (isRecurring && isNew) {
-      return createLifeEvent('schedule_break', `New recurring schedule: ${content.slice(0, 120)}`, 0.50, evidence)
+      const clean = sanitizeLifeEventSummary(content)
+      if (clean) return createLifeEvent('schedule_break', `New recurring ${clean}`.slice(0, 120), 0.50, evidence)
     }
   }
 
@@ -265,9 +292,34 @@ export async function analyzeForLifeEvent(
 function extractSubject(content: string): string {
   const subjectMatch = content.match(/Subject:\s*(.+?)(?:\n|$)/i)
   if (subjectMatch) return subjectMatch[1].trim().slice(0, 100)
-  // First meaningful line
-  const firstLine = content.split('\n').find(l => l.trim().length > 10)
-  return firstLine?.trim().slice(0, 100) || content.slice(0, 80)
+  // First meaningful line that isn't an email header.
+  const lines = content.split('\n')
+  for (const l of lines) {
+    const t = l.trim()
+    if (t.length < 10) continue
+    if (/^(From|To|Cc|Bcc|Subject|Date|Reply-To|Sender|Received|Message-ID):/i.test(t)) continue
+    if (/^https?:\/\//i.test(t)) continue
+    return t.slice(0, 100)
+  }
+  return content.slice(0, 80)
+}
+
+/**
+ * Produce a short, user-facing summary for a life event derived from a
+ * message body. Strips email headers, URLs, and raw technical markers
+ * that leaked through the old path ("From: LinkedIn <updates-noreply@…").
+ */
+function sanitizeLifeEventSummary(content: string): string {
+  if (!content) return ''
+  const subject = extractSubject(content).trim()
+  // Drop anything that still looks like an email header line.
+  if (/^(From|To|Cc|Bcc|Subject|Date):/i.test(subject)) return ''
+  if (/@[a-z0-9.-]+\.[a-z]{2,}/i.test(subject)) {
+    // Contains a raw email address — strip everything from the address on.
+    return subject.replace(/[<(]?\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b[)>]?/gi, '').trim()
+      .slice(0, 100)
+  }
+  return subject.slice(0, 100)
 }
 
 async function checkCorroboration(content: string, timestamp: string): Promise<boolean> {
@@ -347,9 +399,11 @@ async function createLifeEvent(
     m.regenerateOnEvent(`Life event: ${type} — ${summary}`).catch(() => {})
   }).catch(() => {})
 
-  // 6. Generate reasoning chain for the life event
+  // 6. Generate reasoning chain for the life event. Pass the bare summary —
+  // downstream surfaces frame it ("Chain risk: ..." etc). Prefixing here
+  // causes triple-nested labels in whisper bodies.
   import('./chain-reasoner').then(m => {
-    m.generateChain(`Life event: ${summary}`, `life_event_${type}`, `life-${type}`).catch(() => {})
+    m.generateChain(summary, `life_event_${type}`, `life-${type}`).catch(() => {})
   }).catch(() => {})
 
   return event

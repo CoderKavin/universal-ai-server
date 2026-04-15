@@ -33,6 +33,11 @@ import { generateChain, generateChainsForUrgentItems, completeChainStep, getActi
 import { getCachedContext, invalidateCache, getCacheStats, assembleContext, classifyQuery, rebuildCache } from './context-cache'
 import { runPipeline, stageRender, logPipelineEvent, type Candidate, type Signals } from './overlay-pipeline'
 import {
+  validateWhisperForFiring, validateWhisperContent, logWhisperSuppression,
+  isAutomatedSender, extractFromHeader,
+  type WhisperCandidate,
+} from './whisper-pipeline'
+import {
   initDB, migrate, getPool, getSettings, setSetting,
   getLivingProfile, setLivingProfile,
   listContacts, listStaleThreads, listThreadsAwaitingReply,
@@ -1142,6 +1147,128 @@ FORMATTING:
     res.json({ id })
   })
 
+  // Admin: full whisper history + quality audit.
+  app.get('/api/admin/whisper-audit', async (_req, res) => {
+    try {
+      const pool = getPool()
+
+      const totalFires = (await pool.query(
+        `SELECT COUNT(*)::int AS c FROM whisper_log WHERE COALESCE(suppressed, FALSE) = FALSE`,
+      )).rows[0].c
+      const firesByDay = (await pool.query(
+        `SELECT fired_at::date AS day, COUNT(*)::int AS c FROM whisper_log
+         WHERE COALESCE(suppressed, FALSE) = FALSE AND fired_at > NOW() - INTERVAL '14 days'
+         GROUP BY 1 ORDER BY 1 DESC`,
+      )).rows
+      let suppressedReasons: any[] = []
+      try {
+        suppressedReasons = (await pool.query(
+          `SELECT suppressed_reason, COUNT(*)::int AS c FROM whisper_log
+           WHERE suppressed = TRUE AND fired_at > NOW() - INTERVAL '7 days'
+           GROUP BY 1 ORDER BY c DESC LIMIT 20`,
+        )).rows
+      } catch { suppressedReasons = [] }
+
+      // Historic fires that WOULD have been suppressed by the new content
+      // validator — audits the garbage backlog.
+      const recentRows = (await pool.query(
+        `SELECT id, type, severity, body, subtitle, trigger_context, fired_at
+         FROM whisper_log WHERE COALESCE(suppressed, FALSE) = FALSE
+         ORDER BY fired_at DESC LIMIT 500`,
+      )).rows
+
+      const wouldFail: any[] = []
+      for (const r of recentRows) {
+        const v = validateWhisperContent({ body: r.body || '', subtitle: r.subtitle || '', type: r.type })
+        if (!v.ok) {
+          wouldFail.push({
+            id: r.id, type: r.type, severity: r.severity,
+            body: String(r.body || '').slice(0, 120),
+            fired_at: r.fired_at,
+            would_fail_reason: v.reason,
+          })
+        }
+      }
+
+      const byType = (await pool.query(
+        `SELECT type, COUNT(*)::int AS c FROM whisper_log
+         WHERE COALESCE(suppressed, FALSE) = FALSE AND fired_at > NOW() - INTERVAL '30 days'
+         GROUP BY type ORDER BY c DESC`,
+      )).rows
+
+      res.json({
+        total_fires_all_time: totalFires,
+        fires_by_day_last_14: firesByDay,
+        fires_by_type_last_30d: byType,
+        suppressions_last_7d: suppressedReasons,
+        backlog_audit: {
+          scanned: recentRows.length,
+          would_now_be_suppressed: wouldFail.length,
+          samples: wouldFail.slice(0, 20),
+        },
+      })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Admin: life_events contamination audit + cleanup.
+  // Reports rows sourced from automated/newsletter domains and optionally
+  // deletes them. Call with ?delete=1 to actually remove.
+  app.get('/api/admin/life-events-audit', async (req, res) => {
+    try {
+      const pool = getPool()
+      const doDelete = String(req.query.delete || '') === '1'
+
+      const all = await pool.query(
+        `SELECT id, type, summary, confidence, evidence, detected_at
+         FROM life_events ORDER BY detected_at DESC LIMIT 500`,
+      )
+
+      const contaminated: any[] = []
+      for (const row of all.rows) {
+        let auto = false
+        let autoFrom = ''
+        try {
+          const ev = typeof row.evidence === 'string' ? JSON.parse(row.evidence) : row.evidence
+          for (const e of (ev || [])) {
+            const hdr = extractFromHeader(e?.content || '')
+            if (hdr && isAutomatedSender(hdr)) { auto = true; autoFrom = hdr; break }
+          }
+        } catch {}
+        // Also flag summaries that contain raw From: headers or email addresses
+        const summary = String(row.summary || '')
+        const leakedHeader = /\bFrom:\s*[A-Za-z0-9]/.test(summary) || /@[a-z0-9.-]+\.[a-z]{2,}/i.test(summary)
+        if (auto || leakedHeader) {
+          contaminated.push({
+            id: row.id, type: row.type, confidence: row.confidence,
+            summary: summary.slice(0, 120),
+            reason: auto ? `automated_sender:${autoFrom}` : 'header_leaked_into_summary',
+          })
+        }
+      }
+
+      let deleted = 0
+      if (doDelete && contaminated.length > 0) {
+        const ids = contaminated.map(c => c.id)
+        const r = await pool.query(
+          `DELETE FROM life_events WHERE id = ANY($1::text[])`, [ids],
+        )
+        deleted = r.rowCount || 0
+      }
+
+      res.json({
+        scanned: all.rows.length,
+        contaminated_count: contaminated.length,
+        deleted,
+        dry_run: !doDelete,
+        samples: contaminated.slice(0, 30),
+      })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
   // Admin: stats on real phone_notification observations — excludes the
   // synthetic device_ids used during endpoint verification.
   app.get('/api/admin/phone-obs-audit', async (_req, res) => {
@@ -1692,27 +1819,46 @@ FORMATTING:
       // ── Gather trigger candidates ─────────────────────────────
       const candidates: any[] = []
 
-      // 1. Life events (confidence > 80)
+      // 1. Life events (confidence ≥ 0.85 only — up from 0.8)
       const lifeEvents = await pool.query(
-        `SELECT * FROM life_events WHERE confidence > 0.8 AND detected_at > NOW() - INTERVAL '2 hours' ORDER BY detected_at DESC LIMIT 3`
+        `SELECT * FROM life_events WHERE confidence >= 0.85 AND detected_at > NOW() - INTERVAL '2 hours' ORDER BY detected_at DESC LIMIT 3`
       )
       for (const le of lifeEvents.rows) {
+        // Sanity check: if any evidence came from an automated sender, skip.
+        let hasAutomatedEvidence = false
+        try {
+          const evArr = typeof le.evidence === 'string' ? JSON.parse(le.evidence) : le.evidence
+          for (const ev of (evArr || [])) {
+            const fromHdr = extractFromHeader(ev?.content || '')
+            if (fromHdr && isAutomatedSender(fromHdr)) { hasAutomatedEvidence = true; break }
+          }
+        } catch {}
+        if (hasAutomatedEvidence) continue
+
         const severity = le.confidence > 0.9 ? 'critical' : 'normal'
         const ago = Math.round((now.getTime() - new Date(le.detected_at).getTime()) / 60000)
+        // Body is a natural sentence — NO "Life event:" prefix. The summary
+        // from life-events.ts is already sanitized at source now.
+        const cleanSummary = String(le.summary || '').trim().slice(0, 110)
         candidates.push({
           type: 'life_event',
           severity,
-          body: `Life event: ${(le.summary || '').slice(0, 65)}`,
-          subtitle: `detected · ${ago}m ago`,
+          body: cleanSummary,
+          subtitle: `detected ${ago}m ago`,
           trigger_hash: `life_event:${le.id}`,
           trigger_data: { life_event_id: le.id, type: le.type, confidence: le.confidence },
           actions: [{ label: 'View', action: 'view' }, { label: 'Dismiss', action: 'dismiss' }]
         })
       }
 
-      // 2. Chain cascade alerts (3+ pending steps = cascade risk)
+      // 2. Chain cascade alerts (3+ pending steps = cascade risk).
+      // Pull the first chain step's title as the human-facing hook, not the
+      // raw internal trigger_event string (which used to contain nested
+      // "Life event: New project/role: ..." labels).
       const chains = await pool.query(`
-        SELECT ac.id, ac.trigger_event, ac.trigger_entity, COUNT(cs.id)::int as pending_steps
+        SELECT ac.id, ac.trigger_event, ac.trigger_entity,
+               COUNT(cs.id)::int as pending_steps,
+               (SELECT title FROM chain_steps WHERE chain_id = ac.id AND step_number = 1 LIMIT 1) AS first_step_title
         FROM action_chains ac
         JOIN chain_steps cs ON cs.chain_id = ac.id AND cs.status = 'pending'
         WHERE ac.status = 'active' AND ac.created_at > NOW() - INTERVAL '72 hours'
@@ -1720,11 +1866,15 @@ FORMATTING:
         LIMIT 2
       `)
       for (const c of chains.rows) {
+        const hook = String(c.first_step_title || c.trigger_event || '').trim()
+        // Defensive: if hook itself contains leaked internal labels, skip.
+        // The real fix is at generation; this is belt-and-suspenders.
+        if (/\b(life event|chain risk|new project\/role|from:)\s*:/i.test(hook)) continue
         candidates.push({
           type: 'chain_cascade',
           severity: 'high',
-          body: `Chain risk: ${(c.trigger_event || '').slice(0, 60)}`,
-          subtitle: `${c.pending_steps} steps at risk`,
+          body: `${c.pending_steps} steps pending on "${hook.slice(0, 70)}"`,
+          subtitle: 'review chain plan',
           trigger_hash: `chain:${c.id}`,
           trigger_data: { chain_id: c.id, pending_steps: c.pending_steps },
           actions: [{ label: 'View Chain', action: 'view_chain' }, { label: 'Dismiss', action: 'dismiss' }]
@@ -1925,13 +2075,34 @@ FORMATTING:
           }
         }
 
-        // Build whisper object
+        // ── Shared quality gate — same bar as overlay. ───────────
+        // Source filter (automated senders), content quality (no leaked
+        // internal labels, no truncation artifacts, no raw email addrs),
+        // surface coordination (don't compete with visible overlay/feed),
+        // and stricter rate limits (5/day, 1/hour, 24h per-entity).
+        const whisperCandidate: WhisperCandidate = {
+          type: c.type,
+          severity: c.severity,
+          body: c.body,
+          subtitle: c.subtitle,
+          trigger_hash: c.trigger_hash,
+          trigger_data: c.trigger_data,
+          trigger_source: c.trigger_source,
+          actions: c.actions,
+        }
+        const gateResult = await validateWhisperForFiring(pool, whisperCandidate)
+        if (!gateResult.ok) {
+          await logWhisperSuppression(pool, whisperCandidate, gateResult.reason)
+          continue
+        }
+
+        // Build whisper object (already validated — body passed through clean)
         const whisperObj = {
           id: crypto.randomUUID(),
           type: c.type,
           severity: c.severity,
           title: 'IRIS',
-          body: c.body.slice(0, 80),
+          body: c.body,               // no slice(0,80) — validator enforces 140 max
           subtitle: c.subtitle || '',
           actions: c.actions || [],
           trigger_context: c.trigger_hash,

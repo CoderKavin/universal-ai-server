@@ -386,13 +386,17 @@ export async function generateChainsForUrgentItems(): Promise<number> {
     if (result) count++
   }
 
-  // Recent life events
+  // Recent life events. trigger_event stores the raw summary — no "Life
+  // event:" prefix, because downstream surfaces (whispers, overlay) add
+  // their own framing. Prepending a label here produced nested strings
+  // like "Chain risk: Life event: New project/role: From: LinkedIn..."
+  // when three modules each added their own prefix.
   const events = await pool.query(
-    "SELECT type, summary FROM life_events WHERE detected_at > NOW() - INTERVAL '48 hours' ORDER BY detected_at DESC LIMIT 3"
+    "SELECT type, summary FROM life_events WHERE confidence >= 0.8 AND detected_at > NOW() - INTERVAL '48 hours' ORDER BY detected_at DESC LIMIT 3"
   )
   for (const e of events.rows) {
     const result = await generateChain(
-      `Life event: ${e.summary}`,
+      e.summary,
       'life_event',
       `life-${e.type}`
     )
