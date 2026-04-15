@@ -1649,44 +1649,47 @@ FORMATTING:
         '%NASDAQ%', '%S&P 500%', '%bitcoin%', '%Fed rate%',
         '%military leadership%', '%military strike%', '%critical analysis of%',
       ]
-      const like = newsPatterns.map((_, i) => `t ILIKE $${i + 1}`).join(' OR ')
-
+      // ANY($1::text[]) matches if any pattern ILIKE matches. Much cleaner
+      // than N-way OR and sidesteps alias-in-WHERE issues.
       const chains = await pool.query(
-        `SELECT ac.id, ac.trigger_event AS t, ac.trigger_type, ac.trigger_entity, ac.created_at,
+        `SELECT ac.id, ac.trigger_event, ac.trigger_type, ac.trigger_entity, ac.created_at,
                 ac.context_snapshot,
                 (SELECT STRING_AGG(cs.title, ' | ' ORDER BY cs.step_number)
                  FROM chain_steps cs WHERE cs.chain_id = ac.id) AS step_titles
          FROM action_chains ac
-         WHERE (${like})
-            OR EXISTS (SELECT 1 FROM chain_steps cs
-                       WHERE cs.chain_id = ac.id
-                         AND (${newsPatterns.map((_, i) => `cs.title ILIKE $${i + 1} OR cs.description ILIKE $${i + 1}`).join(' OR ')}))
+         WHERE ac.trigger_event ILIKE ANY($1::text[])
+            OR EXISTS (
+              SELECT 1 FROM chain_steps cs
+              WHERE cs.chain_id = ac.id
+                AND (cs.title ILIKE ANY($1::text[]) OR cs.description ILIKE ANY($1::text[]))
+            )
          ORDER BY ac.created_at DESC LIMIT 50`,
-        newsPatterns,
+        [newsPatterns],
       )
 
       const steps = await pool.query(
-        `SELECT cs.id, cs.chain_id, cs.title AS t, cs.description, cs.created_at
+        `SELECT cs.id, cs.chain_id, cs.title, cs.description
          FROM chain_steps cs
-         WHERE (${like}) OR description ILIKE ANY($${newsPatterns.length + 1}::text[])
-         ORDER BY cs.created_at DESC LIMIT 30`,
-        [...newsPatterns, newsPatterns],
+         WHERE cs.title ILIKE ANY($1::text[]) OR cs.description ILIKE ANY($1::text[])
+         LIMIT 30`,
+        [newsPatterns],
       )
 
       const predictedActions = await pool.query(
-        `SELECT id, title AS t, description, trigger_context, related_entity, predicted_at, status
+        `SELECT id, title, description, trigger_context, related_entity, predicted_at, status
          FROM predicted_actions
-         WHERE (${like}) OR description ILIKE ANY($${newsPatterns.length + 1}::text[])
-            OR trigger_context ILIKE ANY($${newsPatterns.length + 1}::text[])
+         WHERE title ILIKE ANY($1::text[])
+            OR description ILIKE ANY($1::text[])
+            OR trigger_context ILIKE ANY($1::text[])
          ORDER BY predicted_at DESC LIMIT 30`,
-        [...newsPatterns, newsPatterns],
+        [newsPatterns],
       )
 
       const lifeEvents = await pool.query(
-        `SELECT id, type, summary AS t, confidence, detected_at
-         FROM life_events WHERE (${like})
+        `SELECT id, type, summary, confidence, detected_at
+         FROM life_events WHERE summary ILIKE ANY($1::text[])
          ORDER BY detected_at DESC LIMIT 30`,
-        newsPatterns,
+        [newsPatterns],
       )
 
       // Find the originating observation for Hegseth specifically (or the
