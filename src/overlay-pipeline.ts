@@ -19,6 +19,7 @@
 
 import crypto from 'crypto'
 import type { Pool } from 'pg'
+import { matchCorrections, scoreFromCorrections, type CorrectionRow } from './dismissal-learning'
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -825,13 +826,16 @@ async function stageScoreAndLearn(
   signals: Signals,
   suppress: (c: Candidate, stage: number, reason: string) => void,
 ): Promise<Candidate | null> {
-  // Fetch learning signals once (90-day window).
+  // Fetch learning signals once (90-day window). Includes new precision
+  // fields (entity_id, signal_strength) so matchCorrections() can prefer
+  // exact entity matches over the old fuzzy substring path.
   const learning = await pool.query(
-    `SELECT trigger_action, user_action, trigger_context, timestamp
+    `SELECT entity_id, trigger_action, user_action, trigger_context,
+            signal_strength, dismiss_source, timestamp
      FROM correction_log
      WHERE timestamp > NOW() - INTERVAL '90 days'`,
   ).catch(() => ({ rows: [] as any[] }))
-  const learningRows: any[] = learning.rows
+  const learningRows: CorrectionRow[] = learning.rows
 
   const now = Date.now()
 
@@ -879,13 +883,21 @@ async function stageScoreAndLearn(
       if (ageDays > 7) breakdown.staleness_penalty = -Math.min(20, Math.round(ageDays / 2))
     }
 
-    // Learning: dismissal penalty (up to -20)
-    const dismissCount = countLearning(learningRows, c, ['dismiss', 'dismissed', 'skip'])
-    if (dismissCount > 0) breakdown.dismissal_penalty = -Math.min(20, dismissCount * 5)
-
-    // Learning: action bonus (up to +10)
-    const actCount = countLearning(learningRows, c, ['acted', 'action_taken', 'approved', 'approve'])
-    if (actCount > 0) breakdown.action_bonus = Math.min(10, actCount * 3)
+    // Learning via shared dismissal-learning helpers. Match precedence:
+    //   1. exact entity_id (precise — a "Rajeev EE interview" dismiss
+    //      will only down-weight the exact entity, not every interview)
+    //   2. ≥2-token overlap on trigger_context (fuzzy fallback)
+    // Explicit dismisses weighted 2x vs implicit ignores.
+    const candTriggerCtx = `${c.raw_title || ''} ${c.raw_body || ''}`
+    const matches = matchCorrections(learningRows, {
+      entity_id: c.entity_id,
+      trigger_context: candTriggerCtx,
+    })
+    const learn = scoreFromCorrections(matches)
+    if (learn.score < 0) breakdown.dismissal_penalty = learn.score
+    if (learn.score > 0) breakdown.action_bonus = learn.score
+    // Expose counts for Stage-10 entity-suppression logic below.
+    ;(c as any)._learn = learn
 
     // User intent signal for email-addressed candidates: if the user has
     // NOT replied to this sender in the last 90 days, a predicted "you'll
@@ -937,9 +949,16 @@ async function stageScoreAndLearn(
     ).length
     const localThreshold = MIN_SCORE + (matcherDismisses >= LEARNING_DISMISS_THRESHOLD ? 10 : 0)
 
-    // Per-entity suppression (2+ dismissals in 14 days)
-    const entityDismisses14 = countEntityDismissals(learningRows, c, 14)
-    if (entityDismisses14 >= 2) {
+    // Per-entity suppression: 2+ dismissals on this exact entity in 14 days.
+    // Counted via the precision-aware matchCorrections (entity_id first).
+    const recentDismisses14 = matchCorrections(
+      learningRows.filter((r: any) => {
+        if (!r.timestamp) return false
+        return Date.now() - new Date(r.timestamp).getTime() < 14 * 86_400_000
+      }),
+      { entity_id: c.entity_id, trigger_context: `${c.raw_title || ''} ${c.raw_body || ''}` },
+    ).filter((r: any) => /dismiss/.test(String(r.user_action || ''))).length
+    if (recentDismisses14 >= 2) {
       suppress(c, 10, 'entity_dismissed_twice_last_14d'); continue
     }
 
@@ -966,34 +985,6 @@ async function stageScoreAndLearn(
     return matcherActionRate(learningRows, b.matcher_name) - matcherActionRate(learningRows, a.matcher_name)
   })
   return passed[0]
-}
-
-function countLearning(rows: any[], c: Candidate, actions: string[]): number {
-  const matchEntity = entityTokensOf(c)
-  if (matchEntity.length === 0) return 0
-  return rows.filter((r: any) => {
-    const ua = String(r.user_action || '').toLowerCase()
-    if (!actions.some(a => ua.includes(a))) return false
-    const ctx = String(r.trigger_context || '').toLowerCase()
-    const trig = String(r.trigger_action || '').toLowerCase()
-    return matchEntity.some(t => ctx.includes(t) || trig.includes(t))
-  }).length
-}
-
-function countEntityDismissals(rows: any[], c: Candidate, windowDays: number): number {
-  const windowMs = windowDays * 86_400_000
-  const now = Date.now()
-  const matchEntity = entityTokensOf(c)
-  if (matchEntity.length === 0) return 0
-  return rows.filter((r: any) => {
-    const ts = r.timestamp ? new Date(r.timestamp).getTime() : 0
-    if (now - ts > windowMs) return false
-    const ua = String(r.user_action || '').toLowerCase()
-    if (!/dismiss/.test(ua)) return false
-    const ctx = String(r.trigger_context || '').toLowerCase()
-    const trig = String(r.trigger_action || '').toLowerCase()
-    return matchEntity.some(t => ctx.includes(t) || trig.includes(t))
-  }).length
 }
 
 function matcherActionRate(rows: any[], matcher: string): number {

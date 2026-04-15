@@ -38,6 +38,10 @@ import {
   type WhisperCandidate,
 } from './whisper-pipeline'
 import {
+  insertCorrectionWithEntity, loadCorrectionsForCandidate, scoreFromCorrections,
+  significantTokens,
+} from './dismissal-learning'
+import {
   initDB, migrate, getPool, getSettings, setSetting,
   getLivingProfile, setLivingProfile,
   listContacts, listStaleThreads, listThreadsAwaitingReply,
@@ -822,6 +826,13 @@ FORMATTING:
     try {
       const pool = getPool()
 
+      // Promote any feed_dismissals whose 60-second undo window has expired.
+      // Cheap query, safe to run on every feed load.
+      await pool.query(
+        `UPDATE feed_dismissals SET status = 'active'
+         WHERE status = 'pending' AND locks_in_at < NOW()`,
+      ).catch(() => {})
+
       const [
         urgentActions,
         todayActions,
@@ -835,8 +846,12 @@ FORMATTING:
         sourceHealth
       ] = await Promise.all([
         // Urgent: predicted actions with urgency critical/high, deduped by title.
-        // Exclude actions whose related email_thread is stale_ignored/ghosted
-        // or whose ignored_count has crossed the auto-dismiss threshold.
+        // Excludes:
+        //   - threads with status stale_ignored/abandoned/ghosted/user_dismissed
+        //   - threads with ignored_count >= 5 (auto-dismissed)
+        //   - threads where stale_days > 30 (dead)
+        //   - any entity_id with a locked-in feed_dismissals row in the
+        //     last 30 days (explicit user dismiss → 30d cooldown)
         pool.query(`
           SELECT DISTINCT ON (LOWER(TRIM(pa.title)))
             pa.id, pa.title, pa.description, pa.action_type, pa.urgency, pa.confidence,
@@ -848,9 +863,15 @@ FORMATTING:
           LEFT JOIN email_threads et ON et.thread_id = REPLACE(pa.related_entity, 'thread-', '')
           WHERE pa.status='pending' AND pa.expires_at > NOW()
             AND pa.urgency IN ('critical', 'high')
-            AND COALESCE(et.status, 'awaiting_reply') NOT IN ('stale_ignored','abandoned','ghosted')
+            AND COALESCE(et.status, 'awaiting_reply') NOT IN ('stale_ignored','abandoned','ghosted','user_dismissed')
             AND COALESCE(et.ignored_count, 0) < 5
             AND (et.stale_days IS NULL OR et.stale_days <= 30)
+            AND NOT EXISTS (
+              SELECT 1 FROM feed_dismissals fd
+              WHERE fd.entity_id = pa.related_entity
+                AND fd.status = 'active'
+                AND fd.expires_at > NOW()
+            )
           ORDER BY LOWER(TRIM(pa.title)), pa.confidence DESC LIMIT 10
         `),
         // Today: medium urgency, deduped by title — same exclusions as URGENT.
@@ -865,9 +886,15 @@ FORMATTING:
           LEFT JOIN email_threads et ON et.thread_id = REPLACE(pa.related_entity, 'thread-', '')
           WHERE pa.status='pending' AND pa.expires_at > NOW()
             AND pa.urgency IN ('medium', 'low')
-            AND COALESCE(et.status, 'awaiting_reply') NOT IN ('stale_ignored','abandoned','ghosted')
+            AND COALESCE(et.status, 'awaiting_reply') NOT IN ('stale_ignored','abandoned','ghosted','user_dismissed')
             AND COALESCE(et.ignored_count, 0) < 5
             AND (et.stale_days IS NULL OR et.stale_days <= 30)
+            AND NOT EXISTS (
+              SELECT 1 FROM feed_dismissals fd
+              WHERE fd.entity_id = pa.related_entity
+                AND fd.status = 'active'
+                AND fd.expires_at > NOW()
+            )
           ORDER BY LOWER(TRIM(pa.title)), pa.confidence DESC LIMIT 10
         `),
         // Ghost: recently expired or low-confidence filtered actions
@@ -963,6 +990,23 @@ FORMATTING:
         }
       }
 
+      // ── Positive-reinforcement lookup ────────────────────────
+      // Pull the last 30 days of approve/act corrections in one query so
+      // scoreAction (called per-card) can do exact-entity-id lookups in
+      // memory instead of one DB round-trip per card.
+      const positiveCorrections = await pool.query(
+        `SELECT entity_id, trigger_action, trigger_context, user_action, signal_strength
+         FROM correction_log
+         WHERE timestamp > NOW() - INTERVAL '30 days'
+           AND (user_action ILIKE '%act%' OR user_action ILIKE '%approve%' OR user_action = 'action_taken')`,
+      ).catch(() => ({ rows: [] as any[] }))
+      const negativeCorrections = await pool.query(
+        `SELECT entity_id, trigger_action, trigger_context, user_action, signal_strength
+         FROM correction_log
+         WHERE timestamp > NOW() - INTERVAL '30 days'
+           AND (user_action ILIKE '%dismiss%' OR user_action = 'dismissed_feed_card' OR user_action = 'dismissed_whisper')`,
+      ).catch(() => ({ rows: [] as any[] }))
+
       // Score urgent/today actions.
       //
       // Old bug: stale_days × 5 (capped 70) gave every 14+d thread the max
@@ -998,6 +1042,36 @@ FORMATTING:
         const ig = Number(a.ignored_count || 0)
         if (ig >= 3) score -= 30
         if (ig >= 5) score -= 100   // effectively removes from urgent/today
+
+        // Positive reinforcement (Gap 3 — symmetry with overlay Stage 10).
+        // Match by exact entity_id first; fall back to ≥2-token overlap on
+        // trigger_context. Approves on this entity OR same action_type
+        // raise the score so frequently-acted-on cards rise faster.
+        const posMatches = scoreFromCorrections(
+          positiveCorrections.rows.filter((r: any) => {
+            if (r.entity_id && a.related_entity && r.entity_id === a.related_entity) return true
+            // action_type proxy: match if both rows mention the same action_type
+            if (a.action_type && String(r.trigger_action || '').includes(a.action_type)) {
+              const cTokens = significantTokens(`${a.title || ''} ${a.trigger_context || ''}`)
+              const rTokens = significantTokens(`${r.trigger_context || ''}`)
+              const cs = new Set(cTokens)
+              let ov = 0
+              for (const t of rTokens) if (cs.has(t) && ++ov >= 2) return true
+            }
+            return false
+          }),
+        )
+        if (posMatches.approve_count >= 3) score += 10
+
+        // Negative reinforcement on same entity_id for predicted_actions
+        // (per-entity dismissals add precision beyond ignored_count).
+        const negMatches = scoreFromCorrections(
+          negativeCorrections.rows.filter((r: any) =>
+            r.entity_id && a.related_entity && r.entity_id === a.related_entity,
+          ),
+        )
+        score += negMatches.score   // already negative
+
         return Math.min(100, score)
       }
 
@@ -1215,6 +1289,160 @@ FORMATTING:
   app.post('/api/actions/:id/approve', async (req, res) => {
     await updateActionStatus(req.params.id, 'approved')
     res.json({ ok: true })
+  })
+
+  // ── POST /api/feed/:item_id/dismiss ─────────────────────────
+  // Explicit "stop showing me this" — distinct from Reject ("this is wrong"
+  // for me) and from implicit ignore (ignored_count++ on render).
+  //
+  // Behavior:
+  //   - Logs correction_log row with signal_strength='explicit'.
+  //   - Inserts a feed_dismissals row with status='pending', locks_in_at
+  //     60 seconds out. Until that timer expires, an undo call removes it.
+  //   - 30-day cooldown on this entity in URGENT/TODAY (enforced by
+  //     /api/feed query joining feed_dismissals).
+  //   - Underlying record status: predicted_action→'dismissed',
+  //     email_thread→'user_dismissed' (not stale_ignored — different signal),
+  //     commitment→'user_dismissed'.
+  //   - ignored_count is NOT incremented for this surfacing.
+  app.post('/api/feed/:item_id/dismiss', async (req, res) => {
+    try {
+      const pool = getPool()
+      const item_id = req.params.item_id
+      const allowedReasons = new Set(['not_relevant', 'too_old', 'handled_elsewhere', 'not_now'])
+      const reason: string | null = (req.body?.reason && allowedReasons.has(req.body.reason)) ? req.body.reason : null
+
+      // Resolve the item: predicted_action by id is the primary case; we
+      // also accept "thread-XXX" or "commitment:UUID" entity-id form.
+      let entity_id: string | null = null
+      let item_type: 'predicted_action' | 'email_thread' | 'commitment' | 'unknown' = 'unknown'
+      let displayContent = ''
+
+      if (item_id.startsWith('thread-')) {
+        item_type = 'email_thread'
+        entity_id = item_id
+        const tid = item_id.slice('thread-'.length)
+        const tRes = await pool.query(`SELECT subject, last_message_from FROM email_threads WHERE thread_id = $1`, [tid])
+        if (tRes.rows[0]) displayContent = `${tRes.rows[0].subject || ''} from ${tRes.rows[0].last_message_from || ''}`
+        await pool.query(
+          `UPDATE email_threads SET status = 'user_dismissed' WHERE thread_id = $1`, [tid],
+        ).catch(() => {})
+      } else if (item_id.startsWith('commitment:')) {
+        item_type = 'commitment'
+        entity_id = item_id
+        const cid = item_id.slice('commitment:'.length)
+        const cRes = await pool.query(`SELECT description FROM commitments WHERE id = $1`, [cid])
+        if (cRes.rows[0]) displayContent = String(cRes.rows[0].description || '')
+        await pool.query(
+          `UPDATE commitments SET status = 'user_dismissed' WHERE id = $1`, [cid],
+        ).catch(() => {})
+      } else {
+        // Predicted action by id
+        item_type = 'predicted_action'
+        const paRes = await pool.query(
+          `SELECT id, title, description, related_entity, trigger_context FROM predicted_actions WHERE id = $1`,
+          [item_id],
+        )
+        if (paRes.rows[0]) {
+          entity_id = paRes.rows[0].related_entity || null
+          displayContent = `${paRes.rows[0].title || ''} — ${paRes.rows[0].description || ''}`.slice(0, 300)
+          await pool.query(
+            `UPDATE predicted_actions SET status = 'dismissed' WHERE id = $1`, [item_id],
+          ).catch(() => {})
+        }
+      }
+
+      // Insert pending feed_dismissals row.
+      const dismissalId = crypto.randomUUID()
+      await pool.query(
+        `INSERT INTO feed_dismissals (id, item_id, entity_id, item_type, reason, status,
+                                       dismissed_at, locks_in_at, expires_at)
+         VALUES ($1, $2, $3, $4, $5, 'pending', NOW(),
+                 NOW() + INTERVAL '60 seconds', NOW() + INTERVAL '30 days')`,
+        [dismissalId, item_id, entity_id, item_type, reason],
+      )
+
+      // Log to correction_log with explicit signal strength.
+      await insertCorrectionWithEntity(pool, {
+        entity_id,
+        trigger_action: `feed:${item_type}`,
+        trigger_context: displayContent,
+        user_action: 'dismissed_feed_card',
+        correction_text: reason ? `User dismissed (${reason}): ${displayContent}` : `User dismissed: ${displayContent}`,
+        signal_strength: 'explicit',
+        dismiss_source: 'feed',
+        dismiss_reason: reason,
+      })
+
+      res.json({
+        ok: true,
+        dismissal_id: dismissalId,
+        undo_window_seconds: 60,
+        undo_url: `/api/feed/dismiss/${dismissalId}/undo`,
+        cooldown_days: 30,
+      })
+    } catch (err: any) {
+      console.error('[feed/dismiss] failed:', err.message)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Undo a feed dismiss within the 60-second window.
+  app.post('/api/feed/dismiss/:dismissal_id/undo', async (req, res) => {
+    try {
+      const pool = getPool()
+      const id = req.params.dismissal_id
+
+      const r = await pool.query(
+        `SELECT item_id, item_type, entity_id, status, locks_in_at, dismissed_at
+         FROM feed_dismissals WHERE id = $1`, [id],
+      )
+      if (r.rows.length === 0) return res.status(404).json({ error: 'dismissal not found' })
+      const row = r.rows[0]
+      if (row.status !== 'pending') return res.status(400).json({ error: 'undo window closed', status: row.status })
+      if (new Date(row.locks_in_at).getTime() < Date.now()) {
+        // Window expired but background promotion hasn't run yet — promote it now.
+        await pool.query(`UPDATE feed_dismissals SET status = 'active' WHERE id = $1 AND status = 'pending'`, [id])
+        return res.status(400).json({ error: 'undo window closed' })
+      }
+
+      // Capture entity_id BEFORE deleting the row.
+      const entityId: string | null = row.entity_id
+      const itemType: string = row.item_type
+      const dismissedAt: string = row.dismissed_at
+
+      // Undo: revert underlying record status.
+      if (itemType === 'predicted_action') {
+        await pool.query(`UPDATE predicted_actions SET status = 'pending' WHERE id = $1 AND status = 'dismissed'`, [row.item_id]).catch(() => {})
+      } else if (itemType === 'email_thread') {
+        const tid = String(row.item_id).slice('thread-'.length)
+        await pool.query(`UPDATE email_threads SET status = 'awaiting_reply' WHERE thread_id = $1 AND status = 'user_dismissed'`, [tid]).catch(() => {})
+      } else if (itemType === 'commitment') {
+        const cid = String(row.item_id).slice('commitment:'.length)
+        await pool.query(`UPDATE commitments SET status = 'active' WHERE id = $1 AND status = 'user_dismissed'`, [cid]).catch(() => {})
+      }
+
+      // Delete the matching correction_log row inserted by the dismiss
+      // handler so it never influences learning. Match on entity + time
+      // window + source — the same dismissal handler uniquely produces this.
+      await pool.query(
+        `DELETE FROM correction_log
+         WHERE user_action = 'dismissed_feed_card'
+           AND dismiss_source = 'feed'
+           AND timestamp >= ($1::timestamptz - INTERVAL '2 seconds')
+           AND timestamp <= ($1::timestamptz + INTERVAL '2 seconds')
+           AND COALESCE(entity_id, '') = COALESCE($2, '')`,
+        [dismissedAt, entityId],
+      ).catch(() => {})
+
+      // Finally remove the feed_dismissals row.
+      await pool.query(`DELETE FROM feed_dismissals WHERE id = $1`, [id])
+
+      res.json({ ok: true, undone: true })
+    } catch (err: any) {
+      console.error('[feed/dismiss/undo] failed:', err.message)
+      res.status(500).json({ error: err.message })
+    }
   })
 
   // ── POST /api/actions/:id/reject ────────────────────────────
@@ -2261,13 +2489,38 @@ FORMATTING:
         )
         if (suppressed.rows.length > 0) continue
 
-        // FILTER 3: Dismissed this type 3+ times in 7 days (active learning)
+        // FILTER 3: Per-entity-per-type learning (Gap 2 fix).
+        // Old: dismissing 3 chain_cascade whispers muted ALL chain_cascades
+        // for 7 days regardless of entity. New behavior:
+        //   (a) entity+type suppressed if 2+ dismisses in 14d (30d mute)
+        //   (b) entire type suppressed only if 10+ DISTINCT entities for
+        //       that type were dismissed in last 30d (means the type
+        //       itself is fundamentally unwanted, not just specific cards)
+        //   (c) Critical severity bypasses the entity-level mute but not
+        //       the type-wide one.
         if (c.severity !== 'critical') {
-          const dismissals = await pool.query(
-            `SELECT COUNT(*)::int as c FROM whisper_log WHERE type = $1 AND user_action = 'dismiss' AND fired_at > NOW() - INTERVAL '7 days'`,
-            [c.type]
+          // (a) per-entity-per-type
+          const entSupp = await pool.query(
+            `SELECT 1 FROM whisper_suppressions
+             WHERE whisper_type = $1 AND entity_id = $2
+               AND suppressed_until > NOW() LIMIT 1`,
+            [c.type, c.trigger_hash],
           )
-          if ((dismissals.rows[0]?.c ?? 0) >= 3) continue
+          if (entSupp.rows.length > 0) {
+            await logWhisperSuppression(pool, c, 'entity_type_suppressed_30d')
+            continue
+          }
+        }
+        // (b) type-wide check applies even to critical
+        const typeWide = await pool.query(
+          `SELECT 1 FROM whisper_suppressions
+           WHERE whisper_type = $1 AND entity_id IS NULL
+             AND suppressed_until > NOW() LIMIT 1`,
+          [c.type],
+        )
+        if (typeWide.rows.length > 0) {
+          await logWhisperSuppression(pool, c, 'type_wide_suppressed_too_broad')
+          continue
         }
 
         // FILTER 4: Rate limits (severity=critical bypasses daily limit but still counts)
@@ -2383,16 +2636,83 @@ FORMATTING:
         }
       }
 
-      // If dismissed, log to correction_log for active learning
+      // If dismissed: log to correction_log + add per-entity-per-type
+      // suppression. If 2+ dismissals on same entity+type in 14 days,
+      // suppress that pair for 30 days. If 10+ DISTINCT entities have
+      // been dismissed for the type in 30 days, suppress the whole type.
       if (action === 'dismiss') {
-        const whisper = await pool.query(`SELECT type, trigger_context, trigger_data, body FROM whisper_log WHERE id = $1`, [whisper_id])
+        const whisper = await pool.query(
+          `SELECT type, trigger_context, trigger_data, body FROM whisper_log WHERE id = $1`,
+          [whisper_id],
+        )
         if (whisper.rows.length > 0) {
           const w = whisper.rows[0]
-          await pool.query(
-            `INSERT INTO correction_log (id, trigger_action, trigger_context, user_action, correction_text, reasoning_chain, affected_claims)
-             VALUES ($1, $2, $3, 'dismissed_whisper', $4, '', '[]')`,
-            [crypto.randomUUID(), `whisper:${w.type}`, w.trigger_context || '', `User dismissed whisper: ${w.body}`]
+          const entityId = w.trigger_context || null  // for whispers, trigger_context IS the entity hash
+          const wType = String(w.type || '')
+
+          await insertCorrectionWithEntity(pool, {
+            entity_id: entityId,
+            trigger_action: `whisper:${wType}`,
+            trigger_context: w.trigger_context || '',
+            user_action: 'dismissed_whisper',
+            correction_text: `User dismissed whisper: ${w.body}`,
+            signal_strength: 'explicit',
+            dismiss_source: 'whisper',
+          })
+
+          // (a) per-entity-per-type: 2+ in 14d → 30d mute on that combo
+          const entityDismissCount = await pool.query(
+            `SELECT COUNT(*)::int AS c FROM correction_log
+             WHERE user_action = 'dismissed_whisper'
+               AND trigger_action = $1
+               AND COALESCE(entity_id, '') = COALESCE($2, '')
+               AND timestamp > NOW() - INTERVAL '14 days'`,
+            [`whisper:${wType}`, entityId],
           )
+          if ((entityDismissCount.rows[0]?.c ?? 0) >= 2 && entityId) {
+            await pool.query(
+              `INSERT INTO whisper_suppressions
+                 (id, trigger_hash, whisper_type, entity_id, suppressed_until, reason)
+               VALUES ($1, $2, $3, $4, NOW() + INTERVAL '30 days', 'entity_dismissed_2x_in_14d')`,
+              [crypto.randomUUID(), entityId, wType, entityId],
+            ).catch(() => {})
+          }
+
+          // (b) type-wide: 10+ distinct entities for this type in 30d → mute type 7d
+          const distinctEntities = await pool.query(
+            `SELECT COUNT(DISTINCT entity_id)::int AS c FROM correction_log
+             WHERE user_action = 'dismissed_whisper'
+               AND trigger_action = $1
+               AND entity_id IS NOT NULL
+               AND timestamp > NOW() - INTERVAL '30 days'`,
+            [`whisper:${wType}`],
+          )
+          if ((distinctEntities.rows[0]?.c ?? 0) >= 10) {
+            await pool.query(
+              `INSERT INTO whisper_suppressions
+                 (id, trigger_hash, whisper_type, entity_id, suppressed_until, reason)
+               VALUES ($1, $2, $3, NULL, NOW() + INTERVAL '7 days', '10_distinct_entities_dismissed_in_30d')`,
+              [crypto.randomUUID(), `type-wide:${wType}`, wType],
+            ).catch(() => {})
+          }
+        }
+      }
+
+      // If acted on (clicked the whisper to take action): positive
+      // reinforcement. 3+ acts on same type in 30d → lower threshold for
+      // that type by 5 (stored as a settings counter consumed at fire time).
+      if (action === 'view' || action === 'open_calendar' || action === 'reply') {
+        const whisper = await pool.query(`SELECT type FROM whisper_log WHERE id = $1`, [whisper_id])
+        if (whisper.rows.length > 0) {
+          const wType = String(whisper.rows[0].type || '')
+          await insertCorrectionWithEntity(pool, {
+            trigger_action: `whisper:${wType}`,
+            trigger_context: '',
+            user_action: 'acted_on_whisper',
+            correction_text: `User acted on ${wType} whisper`,
+            signal_strength: 'explicit',
+            dismiss_source: 'whisper',
+          })
         }
       }
 

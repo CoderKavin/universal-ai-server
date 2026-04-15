@@ -298,6 +298,52 @@ export async function migrate(): Promise<void> {
         WHERE source = 'whatsapp' AND parsed_whatsapp IS NULL;
     `)
 
+    // ── Dismissal learning: precision columns ────────────────────
+    // entity_id is a stable identifier (email, contact id, thread id,
+    // commitment:UUID etc). Used for exact-match learning lookups so
+    // we don't over-generalize when fuzzy-matching trigger_context.
+    // signal_strength: 'explicit' = user clicked Dismiss, 'implicit' =
+    // ignored_count auto-flip — the persona writer weighs these differently.
+    // dismiss_source: which surface fired the dismiss (feed/overlay/whisper).
+    await client.query(`
+      ALTER TABLE correction_log ADD COLUMN IF NOT EXISTS entity_id TEXT;
+      ALTER TABLE correction_log ADD COLUMN IF NOT EXISTS signal_strength TEXT DEFAULT 'explicit';
+      ALTER TABLE correction_log ADD COLUMN IF NOT EXISTS dismiss_source TEXT;
+      ALTER TABLE correction_log ADD COLUMN IF NOT EXISTS dismiss_reason TEXT;
+      CREATE INDEX IF NOT EXISTS idx_correction_log_entity ON correction_log (entity_id, timestamp DESC);
+    `)
+
+    // Per-entity-per-type whisper suppression. NULL entity_id means the
+    // suppression covers the whole type (only set when 10+ distinct entities
+    // have been dismissed for a type within 30 days).
+    await client.query(`
+      ALTER TABLE whisper_suppressions ADD COLUMN IF NOT EXISTS entity_id TEXT;
+      ALTER TABLE whisper_suppressions ADD COLUMN IF NOT EXISTS reason TEXT;
+      CREATE INDEX IF NOT EXISTS idx_whisper_supp_entity_type
+        ON whisper_suppressions (entity_id, whisper_type, suppressed_until DESC);
+    `)
+
+    // Feed dismissals — pending (within 60s undo window) and active.
+    // status: 'pending' (within undo window) | 'active' (locked in)
+    // expires_at applies only when status='active' (30-day cooldown).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS feed_dismissals (
+        id TEXT PRIMARY KEY,
+        item_id TEXT NOT NULL,
+        entity_id TEXT,
+        item_type TEXT NOT NULL,
+        reason TEXT,
+        status TEXT DEFAULT 'pending',
+        dismissed_at TIMESTAMPTZ DEFAULT NOW(),
+        locks_in_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '60 seconds'),
+        expires_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '30 days')
+      );
+      CREATE INDEX IF NOT EXISTS idx_feed_dismissals_entity
+        ON feed_dismissals (entity_id, status, expires_at);
+      CREATE INDEX IF NOT EXISTS idx_feed_dismissals_item
+        ON feed_dismissals (item_id);
+    `)
+
     // ── Feed: ignored-count + thread status columns ──
     // A thread surfaced N times without the user clicking Approve/Dismiss
     // is treated as an implicit dismissal. status='stale_ignored' removes
