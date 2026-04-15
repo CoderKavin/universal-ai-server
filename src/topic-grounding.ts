@@ -60,6 +60,13 @@ const GENERIC_STOPLIST = new Set([
   'changes', 'change', 'changed', 'breaking', 'news', 'report', 'reports',
   'article', 'articles', 'headline', 'headlines', 'story', 'stories',
   'announcement', 'announce', 'statement', 'released', 'launch', 'launched',
+  // news publishers + geopolitical terms — never evidence of user engagement
+  'nytimes', 'breakingnews', 'times', 'york', 'post', 'journal',
+  'reuters', 'bloomberg', 'guardian', 'bbc', 'cnn', 'fox',
+  'nato', 'scotus', 'congress', 'senate', 'ukraine', 'russia', 'china',
+  'israel', 'gaza', 'hamas', 'taiwan', 'iran', 'iraq', 'syria',
+  'pentagon', 'kremlin', 'whitehouse', 'tariff', 'stock', 'market',
+  'nasdaq', 'dow', 'bitcoin', 'crypto', 'policy', 'treaty', 'sanction',
 ])
 
 let _cache: UserEntitySet | null = null
@@ -160,19 +167,21 @@ export async function buildUserEntitySet(pool: Pool): Promise<UserEntitySet> {
     }
   } catch {}
 
-  // 5. Centrum — user explicitly put items on their board, so these
-  // are strongly user-engaged; promote to strict.
+  // 5. Centrum — user created, but JSON.stringify picks up too much
+  // ambient text (column names, emoji, URL fragments). Downgrade to
+  // LOOSE so contaminated centrum rows don't accidentally promote
+  // news tokens to strict.
   try {
     const r = await pool.query(
       `SELECT board_state, today_summary FROM centrum_snapshots
        ORDER BY timestamp DESC LIMIT 3`,
     )
     for (const row of r.rows) {
-      addStrict(row.today_summary, 'centrum')
+      addLoose(row.today_summary, 'centrum')
       if (row.board_state) {
         try {
           const bs = typeof row.board_state === 'string' ? JSON.parse(row.board_state) : row.board_state
-          addStrict(JSON.stringify(bs).slice(0, 4000), 'centrum')
+          addLoose(JSON.stringify(bs).slice(0, 4000), 'centrum')
         } catch {}
       }
     }
