@@ -298,6 +298,22 @@ export async function migrate(): Promise<void> {
         WHERE source = 'whatsapp' AND parsed_whatsapp IS NULL;
     `)
 
+    // ── Feed: ignored-count + thread status columns ──
+    // A thread surfaced N times without the user clicking Approve/Dismiss
+    // is treated as an implicit dismissal. status='stale_ignored' removes
+    // a thread from urgent/today surfaces without deleting history.
+    await client.query(`
+      ALTER TABLE email_threads ADD COLUMN IF NOT EXISTS ignored_count INT DEFAULT 0;
+      ALTER TABLE email_threads ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'awaiting_reply';
+      ALTER TABLE email_threads ADD COLUMN IF NOT EXISTS last_surfaced_at TIMESTAMPTZ;
+      CREATE INDEX IF NOT EXISTS idx_email_threads_status ON email_threads (status);
+    `)
+
+    // Commitments: 'abandoned' status for rows >30 days past due_at.
+    await client.query(`
+      ALTER TABLE commitments ADD COLUMN IF NOT EXISTS abandoned_at TIMESTAMPTZ;
+    `)
+
     // ── Overlay pipeline rebuild (v2): data quality quarantine ──
     // Rows that fail the Stage-2 quality filter 3+ times get flagged here
     // and are skipped by the overlay permanently until manually reviewed.

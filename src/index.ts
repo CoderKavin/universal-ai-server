@@ -825,21 +825,41 @@ FORMATTING:
         obsRate,
         sourceHealth
       ] = await Promise.all([
-        // Urgent: predicted actions with urgency critical/high, deduped by title
+        // Urgent: predicted actions with urgency critical/high, deduped by title.
+        // Exclude actions whose related email_thread is stale_ignored/ghosted
+        // or whose ignored_count has crossed the auto-dismiss threshold.
         pool.query(`
-          SELECT DISTINCT ON (LOWER(TRIM(title)))
-            id, title, description, action_type, urgency, confidence, draft_content, trigger_context, related_entity
-          FROM predicted_actions WHERE status='pending' AND expires_at > NOW()
-          AND urgency IN ('critical', 'high')
-          ORDER BY LOWER(TRIM(title)), confidence DESC LIMIT 10
+          SELECT DISTINCT ON (LOWER(TRIM(pa.title)))
+            pa.id, pa.title, pa.description, pa.action_type, pa.urgency, pa.confidence,
+            pa.draft_content, pa.trigger_context, pa.related_entity,
+            COALESCE(et.ignored_count, 0) AS ignored_count,
+            et.status AS thread_status,
+            et.stale_days AS thread_stale_days
+          FROM predicted_actions pa
+          LEFT JOIN email_threads et ON et.thread_id = REPLACE(pa.related_entity, 'thread-', '')
+          WHERE pa.status='pending' AND pa.expires_at > NOW()
+            AND pa.urgency IN ('critical', 'high')
+            AND COALESCE(et.status, 'awaiting_reply') NOT IN ('stale_ignored','abandoned','ghosted')
+            AND COALESCE(et.ignored_count, 0) < 5
+            AND (et.stale_days IS NULL OR et.stale_days <= 30)
+          ORDER BY LOWER(TRIM(pa.title)), pa.confidence DESC LIMIT 10
         `),
-        // Today: medium urgency, deduped by title
+        // Today: medium urgency, deduped by title — same exclusions as URGENT.
         pool.query(`
-          SELECT DISTINCT ON (LOWER(TRIM(title)))
-            id, title, description, action_type, urgency, confidence, draft_content, trigger_context, related_entity
-          FROM predicted_actions WHERE status='pending' AND expires_at > NOW()
-          AND urgency IN ('medium', 'low')
-          ORDER BY LOWER(TRIM(title)), confidence DESC LIMIT 10
+          SELECT DISTINCT ON (LOWER(TRIM(pa.title)))
+            pa.id, pa.title, pa.description, pa.action_type, pa.urgency, pa.confidence,
+            pa.draft_content, pa.trigger_context, pa.related_entity,
+            COALESCE(et.ignored_count, 0) AS ignored_count,
+            et.status AS thread_status,
+            et.stale_days AS thread_stale_days
+          FROM predicted_actions pa
+          LEFT JOIN email_threads et ON et.thread_id = REPLACE(pa.related_entity, 'thread-', '')
+          WHERE pa.status='pending' AND pa.expires_at > NOW()
+            AND pa.urgency IN ('medium', 'low')
+            AND COALESCE(et.status, 'awaiting_reply') NOT IN ('stale_ignored','abandoned','ghosted')
+            AND COALESCE(et.ignored_count, 0) < 5
+            AND (et.stale_days IS NULL OR et.stale_days <= 30)
+          ORDER BY LOWER(TRIM(pa.title)), pa.confidence DESC LIMIT 10
         `),
         // Ghost: recently expired or low-confidence filtered actions
         pool.query(`
@@ -934,22 +954,41 @@ FORMATTING:
         }
       }
 
-      // Score urgent/today actions
+      // Score urgent/today actions.
+      //
+      // Old bug: stale_days × 5 (capped 70) gave every 14+d thread the max
+      // bonus, so 72-day-stale threads ranked equal to 14-day-stale ones
+      // and CAS Posters / CAS WLFLO / MITES dominated URGENT NOW for months
+      // after Kavin stopped engaging. Fixed with a sweet-spot curve:
+      // peak 4-7 days, then taper, then penalize heavily past 30 days.
       function scoreAction(a: any): number {
         let score = 0
-        // Stale days signal (from trigger_context — e.g. "stale for 16 days")
-        const staleMatch = (a.trigger_context || '').match(/(\d+)\s*days?\s*stale/i)
-        if (staleMatch) score += Math.min(70, parseInt(staleMatch[1]) * 5)
+        // Stale-day sweet spot — peaks at 4-7d, tapers, penalizes >30d
+        const staleMatch = (a.trigger_context || '').match(/(\d+)\s*days?\s*(?:stale|awaiting)/i)
+        if (staleMatch) {
+          const d = parseInt(staleMatch[1])
+          if (d <= 3)        score += 10            // too fresh
+          else if (d <= 7)   score += 60            // peak urgency window
+          else if (d <= 14)  score += 35
+          else if (d <= 30)  score += 15            // cleanup territory
+          else               score -= 40            // ghost — user voted no
+        }
         // Days since last contact (enriched relationship cards — e.g. "15d since last contact")
         const contactMatch = (a.trigger_context || '').match(/(\d+)d since last contact/)
-        if (contactMatch) score += Math.min(30, parseInt(contactMatch[1]) * 2)
-        // Top contact bonus
+        if (contactMatch) {
+          const d = parseInt(contactMatch[1])
+          if (d >= 4 && d <= 30) score += Math.min(30, d * 2)
+          else if (d > 30)       score -= 20
+        }
+        // Top contact bonus — only helps if the window is still active
         const titleLower = (a.title || '').toLowerCase()
         if (topContactNames.some((n: string) => titleLower.includes(n))) score += 20
-        // Deadline proximity
-        if (a.urgency === 'critical') score += 15
         // Chain cascade bonus
         if (a.related_entity && chains[a.related_entity]) score += 10
+        // Ignored-count penalty — user has voted with silence
+        const ig = Number(a.ignored_count || 0)
+        if (ig >= 3) score -= 30
+        if (ig >= 5) score -= 100   // effectively removes from urgent/today
         return Math.min(100, score)
       }
 
@@ -1051,6 +1090,82 @@ FORMATTING:
       const urgentOverflow = Math.max(0, scoredUrgent.length - 3)
       const todayOverflow = Math.min(3, Math.max(0, scoredToday.length - 3))
 
+      // ── Ignored-count tracking ────────────────────────────────
+      // Every thread that gets surfaced in URGENT or TODAY increments
+      // ignored_count. When a user clicks Approve or Dismiss, the relevant
+      // handler resets or advances status; until then, N renders with no
+      // click is treated as implicit dismissal (spec FIX 3).
+      // Auto-flip status at 5+ so the thread disappears from active sections.
+      const finalUrgent = scoredUrgent.slice(0, 3)
+      const finalToday = scoredToday.slice(0, 3)
+      const surfacedThreadIds: string[] = []
+      for (const a of [...finalUrgent, ...finalToday]) {
+        if (typeof a.related_entity === 'string' && a.related_entity.startsWith('thread-')) {
+          surfacedThreadIds.push(a.related_entity.slice('thread-'.length))
+        }
+      }
+      if (surfacedThreadIds.length > 0) {
+        try {
+          await pool.query(
+            `UPDATE email_threads
+             SET ignored_count = COALESCE(ignored_count, 0) + 1,
+                 last_surfaced_at = NOW(),
+                 status = CASE
+                   WHEN COALESCE(ignored_count, 0) + 1 >= 5 AND COALESCE(status, 'awaiting_reply') = 'awaiting_reply'
+                     THEN 'stale_ignored'
+                   ELSE COALESCE(status, 'awaiting_reply')
+                 END
+             WHERE thread_id = ANY($1::text[])`,
+            [surfacedThreadIds],
+          )
+        } catch (err: any) {
+          console.error('[feed] ignored_count update failed:', err.message)
+        }
+      }
+
+      // ── GHOSTED section ───────────────────────────────────────
+      // Transparency surface: show the user what IRIS has decided NOT to
+      // bother them about. Collapsed by default client-side.
+      const ghostedRes = await pool.query(
+        `SELECT thread_id, subject, last_message_from, stale_days, ignored_count, status, last_surfaced_at
+         FROM email_threads
+         WHERE status IN ('stale_ignored','ghosted')
+            OR (awaiting_reply = 1 AND stale_days > 30)
+            OR ignored_count >= 5
+         ORDER BY COALESCE(last_surfaced_at, NOW() - INTERVAL '1 day') DESC
+         LIMIT 10`,
+      ).catch(() => ({ rows: [] as any[] }))
+
+      const abandonedCommitmentsRes = await pool.query(
+        `SELECT id, description, due_at, abandoned_at
+         FROM commitments
+         WHERE status = 'abandoned'
+            OR (status = 'active' AND due_at IS NOT NULL
+                AND due_at::text < (NOW() - INTERVAL '30 days')::text)
+         ORDER BY COALESCE(abandoned_at, due_at::timestamptz) DESC LIMIT 10`,
+      ).catch(() => ({ rows: [] as any[] }))
+
+      const ghosted = [
+        ...ghostedRes.rows.map((r: any) => ({
+          type: 'stale_thread',
+          subject: r.subject,
+          from: r.last_message_from,
+          stale_days: r.stale_days,
+          ignored_count: r.ignored_count,
+          reason: r.status === 'stale_ignored'
+            ? 'ignored_5_times_or_more'
+            : r.stale_days > 60 ? 'dead_thread_60d_no_reply'
+            : r.stale_days > 30 ? 'stale_30d_no_reply'
+            : 'manually_ghosted',
+        })),
+        ...abandonedCommitmentsRes.rows.map((r: any) => ({
+          type: 'abandoned_commitment',
+          description: String(r.description || '').slice(0, 120),
+          due_at: r.due_at,
+          reason: 'over_30_days_past_due',
+        })),
+      ]
+
       res.json({
         status: {
           obsLastHour: obsRate.rows[0]?.c || 0,
@@ -1061,13 +1176,15 @@ FORMATTING:
           sourceBreakdown: sourceHealth.rows.reduce((acc: any, r: any) => { acc[r.source] = r.c; return acc }, {}),
           lastObservation: new Date().toISOString()
         },
-        urgent: scoredUrgent.slice(0, 3),
+        urgent: finalUrgent,
         urgentOverflow,
-        today: scoredToday.slice(0, 3),
+        today: finalToday,
         todayOverflow,
         noticed,
         noticedOverflow: Math.max(0, noticedOverflow),
         ghost: ghostActions.rows,
+        ghosted,                         // NEW: stale_ignored threads + abandoned commitments
+        ghostedCount: ghosted.length,
         chains
       })
     } catch (err: any) {
@@ -1206,6 +1323,71 @@ FORMATTING:
           would_now_be_suppressed: wouldFail.length,
           samples: wouldFail.slice(0, 20),
         },
+      })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Admin: surface cleanup — one-shot sweep of dead threads + commitments.
+  //   GET  /api/admin/surface-cleanup           → dry run, reports counts
+  //   POST /api/admin/surface-cleanup?execute=1 → actually flips statuses
+  // Thread rule: awaiting_reply AND stale_days >= 30 → status='stale_ignored'
+  // Commitment rule: status='active' AND due_at < NOW() - 30d → status='abandoned'
+  app.get('/api/admin/surface-cleanup', async (_req, res) => {
+    try {
+      const pool = getPool()
+      const threadsToMark = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM email_threads
+         WHERE awaiting_reply = 1 AND stale_days >= 30
+           AND COALESCE(status, 'awaiting_reply') = 'awaiting_reply'`,
+      )
+      const commitmentsToMark = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM commitments
+         WHERE status = 'active' AND due_at IS NOT NULL
+           AND due_at::text < (NOW() - INTERVAL '30 days')::text`,
+      )
+      const threadsOver60 = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM email_threads
+         WHERE awaiting_reply = 1 AND stale_days >= 60`,
+      )
+      res.json({
+        dry_run: true,
+        would_mark_threads_stale_ignored: threadsToMark.rows[0].c,
+        would_mark_commitments_abandoned: commitmentsToMark.rows[0].c,
+        threads_over_60_days: threadsOver60.rows[0].c,
+        how_to_execute: 'POST /api/admin/surface-cleanup?execute=1',
+      })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.post('/api/admin/surface-cleanup', async (req, res) => {
+    try {
+      const pool = getPool()
+      const execute = String(req.query.execute || '') === '1'
+      if (!execute) {
+        return res.status(400).json({ error: 'must pass ?execute=1 to run destructively' })
+      }
+      const tRes = await pool.query(
+        `UPDATE email_threads
+         SET status = 'stale_ignored'
+         WHERE awaiting_reply = 1 AND stale_days >= 30
+           AND COALESCE(status, 'awaiting_reply') = 'awaiting_reply'
+         RETURNING thread_id`,
+      )
+      const cRes = await pool.query(
+        `UPDATE commitments
+         SET status = 'abandoned', abandoned_at = NOW()
+         WHERE status = 'active' AND due_at IS NOT NULL
+           AND due_at::text < (NOW() - INTERVAL '30 days')::text
+         RETURNING id`,
+      )
+      res.json({
+        dry_run: false,
+        threads_marked_stale_ignored: tRes.rowCount,
+        commitments_marked_abandoned: cRes.rowCount,
       })
     } catch (err: any) {
       res.status(500).json({ error: err.message })
