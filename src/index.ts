@@ -1654,8 +1654,11 @@ FORMATTING:
       clearEntitySetCache()  // always fresh for inspection
       const s = await buildUserEntitySet(pool)
       res.json({
-        token_count: s.tokens.size,
-        sample_tokens: Array.from(s.tokens).slice(0, 80),
+        strict_count: s.strict_tokens.size,
+        loose_count: s.loose_tokens.size,
+        total: s.tokens.size,
+        sample_strict: Array.from(s.strict_tokens).slice(0, 40),
+        sample_loose: Array.from(s.loose_tokens).slice(0, 40),
         source_counts: s.source_counts,
       })
     } catch (err: any) {

@@ -21,10 +21,46 @@ import { significantTokens } from './dismissal-learning'
 // ── User entity set (cached in-process for 2 minutes) ────────────
 
 interface UserEntitySet {
-  tokens: Set<string>           // significant tokens (≥4 chars, lowercase)
-  built_at: number               // Date.now() when built
+  // STRICT: proper nouns that identify a specific person, org, or project
+  // the user is actively engaged with. Matching one of these is strong
+  // enough to ground a topic. Drawn from contact names, calendar
+  // participants, hardcoded project names, commitment "committed_to" etc.
+  strict_tokens: Set<string>
+  // LOOSE: all other vocabulary (persona text, commitment descriptions,
+  // centrum board contents). Matching these alone is NOT enough — they
+  // count only as corroboration (need ≥2 to ground).
+  loose_tokens: Set<string>
+  built_at: number
   source_counts: Record<string, number>
+  // Back-compat alias so older callers using .tokens don't break.
+  tokens: Set<string>
 }
+
+// Generic words that appear in almost any persona/commitment but don't
+// identify a specific user-engagement. These are SUBTRACTED from both
+// strict and loose sets — matching them counts as zero.
+const GENERIC_STOPLIST = new Set([
+  // analytical
+  'critical', 'analysis', 'research', 'discussion', 'review', 'study',
+  'work', 'working', 'task', 'tasks', 'project', 'projects', 'plan',
+  'planning', 'plans', 'strategy', 'approach', 'framework', 'process',
+  'important', 'urgent', 'priority', 'priorities', 'focus', 'consider',
+  'update', 'updates', 'progress', 'complete', 'completed', 'done',
+  // leadership / org-generic
+  'leadership', 'leader', 'team', 'teams', 'group', 'groups', 'member',
+  'members', 'organization', 'management', 'manager', 'director',
+  'department', 'community', 'network', 'committee',
+  // time
+  'today', 'tomorrow', 'yesterday', 'week', 'weekly', 'month', 'monthly',
+  'year', 'yearly', 'daily', 'recent', 'current', 'future', 'past',
+  // email / action generic (already in dismissal-learning but defensive here too)
+  'reply', 'follow', 'draft', 'send', 'share', 'message', 'email', 'emails',
+  'meeting', 'meetings', 'call', 'calls', 'zoom', 'invitation',
+  // news-y verbs that show up everywhere
+  'changes', 'change', 'changed', 'breaking', 'news', 'report', 'reports',
+  'article', 'articles', 'headline', 'headlines', 'story', 'stories',
+  'announcement', 'announce', 'statement', 'released', 'launch', 'launched',
+])
 
 let _cache: UserEntitySet | null = null
 const CACHE_MS = 2 * 60 * 1000
@@ -43,41 +79,60 @@ export async function buildUserEntitySet(pool: Pool): Promise<UserEntitySet> {
   const now = Date.now()
   if (_cache && now - _cache.built_at < CACHE_MS) return _cache
 
-  const tokens = new Set<string>()
+  const strict = new Set<string>()
+  const loose = new Set<string>()
   const counts: Record<string, number> = {}
 
-  const add = (text: string | null | undefined, srcKey: string): void => {
+  // STRICT tier: tokens we trust on their own (proper nouns identifying
+  // a person/org/project the user is actively engaged with).
+  const addStrict = (text: string | null | undefined, srcKey: string): void => {
     if (!text) return
     const toks = significantTokens(text)
-    for (const t of toks) tokens.add(t)
+    for (const t of toks) {
+      if (GENERIC_STOPLIST.has(t)) continue
+      strict.add(t)
+    }
+    counts[srcKey] = (counts[srcKey] || 0) + toks.length
+  }
+  // LOOSE tier: corroborative tokens (need 2+ matches to ground).
+  const addLoose = (text: string | null | undefined, srcKey: string): void => {
+    if (!text) return
+    const toks = significantTokens(text)
+    for (const t of toks) {
+      if (GENERIC_STOPLIST.has(t)) continue
+      if (strict.has(t)) continue  // don't duplicate into loose
+      loose.add(t)
+    }
     counts[srcKey] = (counts[srcKey] || 0) + toks.length
   }
 
-  // 1. Relationships (names + email local-parts of top-50 closeness)
+  // 1. Relationships — contact names are strong identifiers. Email
+  // local-parts same. Closeness > 5 keeps out one-off addresses.
   try {
     const r = await pool.query(
       `SELECT name, email FROM relationships WHERE current_closeness > 5
-       ORDER BY current_closeness DESC LIMIT 200`,
+       ORDER BY current_closeness DESC LIMIT 300`,
     )
     for (const row of r.rows) {
-      add(row.name, 'relationships')
-      if (row.email) add(String(row.email).split('@')[0], 'relationships')
+      addStrict(row.name, 'relationships')
+      if (row.email) addStrict(String(row.email).split('@')[0], 'relationships')
     }
   } catch {}
 
-  // 2. Active commitments
+  // 2. Active commitments — committed_to is a strong identifier
+  // (a named person/org). Description goes into LOOSE.
   try {
     const r = await pool.query(
       `SELECT description, committed_to FROM commitments
        WHERE status = 'active' LIMIT 200`,
     )
     for (const row of r.rows) {
-      add(row.description, 'commitments')
-      add(row.committed_to, 'commitments')
+      addStrict(row.committed_to, 'commitments')
+      addLoose(row.description, 'commitments')
     }
   } catch {}
 
-  // 3. Upcoming calendar events (next 14 days)
+  // 3. Upcoming calendar events — participants are strong, summary loose.
   try {
     const r = await pool.query(
       `SELECT summary, participants FROM calendar_events
@@ -87,51 +142,60 @@ export async function buildUserEntitySet(pool: Pool): Promise<UserEntitySet> {
        LIMIT 100`,
     )
     for (const row of r.rows) {
-      add(row.summary, 'calendar')
+      addLoose(row.summary, 'calendar')
       try {
         const parts = typeof row.participants === 'string' ? JSON.parse(row.participants) : row.participants
-        if (Array.isArray(parts)) for (const p of parts) add(String(p), 'calendar')
+        if (Array.isArray(parts)) for (const p of parts) addStrict(String(p), 'calendar')
       } catch {}
     }
   } catch {}
 
-  // 4. Living profile (persona)
+  // 4. Living profile — ALL loose. Persona text has too many generic
+  // analytical words ("critical", "analysis", "leadership") that would
+  // accidentally ground news articles if we treated them as strict.
   try {
     const r = await pool.query(`SELECT content FROM living_profile WHERE id='main' LIMIT 1`)
     if (r.rows[0]?.content) {
-      add(String(r.rows[0].content).slice(0, 4000), 'persona')
+      addLoose(String(r.rows[0].content).slice(0, 4000), 'persona')
     }
   } catch {}
 
-  // 5. Recent centrum snapshots — things the user actively put on their board
+  // 5. Centrum — user explicitly put items on their board, so these
+  // are strongly user-engaged; promote to strict.
   try {
     const r = await pool.query(
       `SELECT board_state, today_summary FROM centrum_snapshots
        ORDER BY timestamp DESC LIMIT 3`,
     )
     for (const row of r.rows) {
-      add(row.today_summary, 'centrum')
+      addStrict(row.today_summary, 'centrum')
       if (row.board_state) {
         try {
           const bs = typeof row.board_state === 'string' ? JSON.parse(row.board_state) : row.board_state
-          add(JSON.stringify(bs).slice(0, 4000), 'centrum')
+          addStrict(JSON.stringify(bs).slice(0, 4000), 'centrum')
         } catch {}
       }
     }
   } catch {}
 
-  // 6. Hardcoded IRIS/Kavin projects that might not yet appear in above queries
-  // (we explicitly keep this list short — everything else should come from DB).
+  // 6. Hardcoded project names — strong.
   const KNOWN_PROJECTS = [
     'tattva', 'iris', 'centrum', 'airpoint', 'chetana',
-    'extended', 'essay', 'ibdp', 'trins', 'kavin', 'venkatesan',
-    'physics', 'mathematics', 'economics', 'english', 'tok',
-    'history', 'biology', 'chemistry',
+    'trins', 'kavin', 'venkatesan',
   ]
-  for (const p of KNOWN_PROJECTS) tokens.add(p)
+  for (const p of KNOWN_PROJECTS) strict.add(p)
   counts['hardcoded_projects'] = KNOWN_PROJECTS.length
 
-  const built: UserEntitySet = { tokens, built_at: now, source_counts: counts }
+  // Merged view for back-compat and quick lookup.
+  const merged = new Set<string>([...strict, ...loose])
+
+  const built: UserEntitySet = {
+    strict_tokens: strict,
+    loose_tokens: loose,
+    tokens: merged,
+    built_at: now,
+    source_counts: counts,
+  }
   _cache = built
   return built
 }
@@ -167,13 +231,18 @@ export async function checkTopicGrounding(
   pool: Pool,
   candidateText: string | null | undefined,
 ): Promise<GroundingResult> {
-  const candTokens = significantTokens(candidateText || '')
+  const rawTokens = significantTokens(candidateText || '')
+  // Filter out generic words from the candidate too — otherwise a news
+  // article full of "analysis / leadership / research" would ground by
+  // matching the generic words present in the persona.
+  const candTokens = rawTokens.filter(t => !GENERIC_STOPLIST.has(t))
+
   if (candTokens.length === 0) {
-    return { grounded: false, matched_tokens: [], candidate_tokens: [], reason: 'empty_candidate' }
+    return { grounded: false, matched_tokens: [], candidate_tokens: rawTokens, reason: 'empty_or_all_generic' }
   }
 
   const entitySet = await buildUserEntitySet(pool)
-  if (entitySet.tokens.size === 0) {
+  if (entitySet.strict_tokens.size === 0 && entitySet.loose_tokens.size === 0) {
     return {
       grounded: true,
       matched_tokens: [],
@@ -182,25 +251,37 @@ export async function checkTopicGrounding(
     }
   }
 
-  const matched: string[] = []
+  const strictMatches: string[] = []
+  const looseMatches: string[] = []
   for (const t of candTokens) {
-    if (entitySet.tokens.has(t)) matched.push(t)
+    if (entitySet.strict_tokens.has(t)) strictMatches.push(t)
+    else if (entitySet.loose_tokens.has(t)) looseMatches.push(t)
   }
 
-  if (matched.length === 0) {
+  // Rule: one STRICT match is enough. Two LOOSE matches is enough.
+  // Anything else = ungrounded.
+  if (strictMatches.length >= 1) {
     return {
-      grounded: false,
-      matched_tokens: [],
+      grounded: true,
+      matched_tokens: strictMatches,
       candidate_tokens: candTokens,
-      reason: 'topic_not_grounded_in_user_context',
+      reason: 'grounded_strict',
+    }
+  }
+  if (looseMatches.length >= 2) {
+    return {
+      grounded: true,
+      matched_tokens: looseMatches,
+      candidate_tokens: candTokens,
+      reason: 'grounded_loose_corroboration',
     }
   }
 
   return {
-    grounded: true,
-    matched_tokens: matched,
+    grounded: false,
+    matched_tokens: looseMatches,    // show what we *did* match, if anything
     candidate_tokens: candTokens,
-    reason: 'grounded',
+    reason: looseMatches.length === 1 ? 'single_loose_token_insufficient' : 'topic_not_grounded_in_user_context',
   }
 }
 
