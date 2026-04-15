@@ -415,18 +415,29 @@ FORMATTING:
           messages: [{ role: 'user', content }]
         }, 'spotlight-stream')
 
-        for await (const event of stream) {
-          if (abortController.signal.aborted) break
-          if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
-            const chunk = event.delta.text || ''
-            if (chunk) {
-              fullText += chunk
-              res.write(`data: ${JSON.stringify({ type: 'text', content: chunk })}\n\n`)
+        // Use the SDK's MessageStream helper — `.on('text', ...)` is the
+        // documented stable API that ships with `messages.stream()`. It
+        // emits plain text deltas regardless of internal event shape.
+        stream.on('text', (text: string) => {
+          if (abortController.signal.aborted) return
+          if (!text) return
+          fullText += text
+          try {
+            res.write(`data: ${JSON.stringify({ type: 'text', content: text })}\n\n`)
+          } catch {}
+        })
+
+        const finalMessage = await stream.finalMessage()
+        finishReason = finalMessage?.stop_reason || null
+
+        // Belt-and-suspenders: if .on('text') never fired but the final
+        // message has text content, drain it synthetically.
+        if (fullText.length === 0 && Array.isArray(finalMessage?.content)) {
+          for (const block of finalMessage.content) {
+            if (block?.type === 'text' && block.text) {
+              fullText += block.text
+              res.write(`data: ${JSON.stringify({ type: 'text', content: block.text })}\n\n`)
             }
-          } else if (event.type === 'message_delta') {
-            if (event.delta?.stop_reason) finishReason = event.delta.stop_reason
-          } else if (event.type === 'message_stop') {
-            break
           }
         }
       } catch (err: any) {
