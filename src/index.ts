@@ -1212,6 +1212,18 @@ FORMATTING:
     }
   })
 
+  // Admin: pure-function test of whisper content validator. Feed a body,
+  // get ok:true/false back with the specific rule that rejected it.
+  app.post('/api/admin/whisper-validate', (req, res) => {
+    try {
+      const { body, subtitle, type } = req.body || {}
+      const v = validateWhisperContent({ body: String(body || ''), subtitle: String(subtitle || ''), type: String(type || 'test') })
+      res.json(v)
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
   // Admin: life_events contamination audit + cleanup.
   // Reports rows sourced from automated/newsletter domains and optionally
   // deletes them. Call with ?delete=1 to actually remove.
