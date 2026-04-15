@@ -2088,7 +2088,12 @@ FORMATTING:
             raw_title: `Probably replying to ${name}`,
             raw_body: la.draft_content ? 'Draft ready to send' : (la.trigger_context || '').slice(0, 120),
             raw_content: la.description || la.trigger_context || '',
-            base_confidence: 76,
+            // Predictive is by definition a GUESS. Floor at 60 — the pipeline's
+            // matcher-family cap (75) then prevents bonuses from inflating
+            // this into a "confidence 99" for something the user hasn't asked
+            // for. Only a direct entity match on the current screen can
+            // bypass the cap (see pipeline scoring stage).
+            base_confidence: 60,
             entity_id: la.related_entity || name,
             button: la.draft_content ? 'Draft' : 'View',
             action_type: la.draft_content ? 'use_draft' : 'view',
@@ -2578,6 +2583,8 @@ FORMATTING:
         chain_hint: best.chain_hint,
         pattern_score: best.pattern_score,
         upgrade: best.upgrade,
+        matcher_name: best.matcher_name,
+        score_breakdown: best._score_breakdown,  // transparency — clients can log/inspect
       })
     } catch (err: any) {
       console.error('[overlay] Evaluate failed:', err.message, err.stack)
@@ -2960,6 +2967,105 @@ FORMATTING:
     }
   })
 
+  // Inspect recent overlay_log entries with full signals + content.
+  // Use this to diagnose a specific fire — see exactly what stage and
+  // what signals produced a card.
+  app.get('/api/admin/overlay-recent', async (req, res) => {
+    try {
+      const pool = getPool()
+      const limit = Math.min(parseInt((req.query.limit as string) || '20', 10), 200)
+      const r = await pool.query(
+        `SELECT id, timestamp, outcome, reason, entity_id, insight_type,
+                matcher_name, stage, confidence, content_snapshot, signals_snapshot
+         FROM overlay_log
+         ORDER BY timestamp DESC LIMIT $1`,
+        [limit],
+      )
+      res.json({ rows: r.rows })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Evaluate overlay using the REAL current context — query the latest
+  // screen_capture / app_activity observation and feed it to the pipeline.
+  // Use this for honest production verification instead of the earlier
+  // mock-curl pattern that let me falsely report "the user was in Gmail"
+  // when they weren't.
+  app.post('/api/admin/overlay-evaluate-live', async (req, res) => {
+    try {
+      const pool = getPool()
+      const mode = (req.body && req.body.mode) === 'proactive' ? 'proactive' : 'reactive'
+
+      // Source of truth: the most recent screen observation. If there isn't
+      // one, we say so explicitly rather than inventing a context.
+      const obsRes = await pool.query(
+        `SELECT timestamp, raw_content FROM observations
+         WHERE source IN ('screen_capture', 'app_activity')
+         ORDER BY timestamp DESC LIMIT 1`,
+      )
+      const lastObs = obsRes.rows[0]
+      if (!lastObs) {
+        return res.json({
+          test_input_real: false,
+          reason: 'no_screen_capture_or_app_activity_observations_exist',
+          mode,
+          forwarded: null,
+        })
+      }
+
+      const ageMs = Date.now() - new Date(lastObs.timestamp).getTime()
+      const rc = String(lastObs.raw_content || '')
+      const appMatch = rc.match(/^App:\s*(.+)$/m)
+      const titleMatch = rc.match(/^Window:\s*(.+)$/m)
+      const urlMatch = rc.match(/^URL:\s*(.+)$/m)
+      const textMatch = rc.match(/Text:\s*([\s\S]*)$/m)
+
+      const signals = {
+        ocr_text: textMatch ? textMatch[1].slice(0, 1500) : '',
+        app: appMatch ? appMatch[1].trim() : '',
+        window_title: titleMatch ? titleMatch[1].trim() : '',
+        url: urlMatch ? urlMatch[1].trim() : '',
+        file_path: '',
+        mode,
+      }
+
+      // Forward the REAL signals into the normal evaluator.
+      const forwarded = await (async () => {
+        const url = `http://localhost:${PORT}/api/overlay/evaluate`
+        try {
+          const fetchRes = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${ACCESS_TOKEN}`,
+            },
+            body: JSON.stringify(signals),
+          })
+          return await fetchRes.json()
+        } catch (err: any) {
+          return { error: err.message }
+        }
+      })()
+
+      res.json({
+        test_input_real: true,
+        observation_age_ms: ageMs,
+        observation_age_human: ageMs > 60_000 ? `${Math.round(ageMs / 1000)}s (stale)` : `${Math.round(ageMs / 1000)}s`,
+        signals_derived_from_observation: {
+          app: signals.app,
+          window_title: signals.window_title,
+          url: signals.url,
+          ocr_length: signals.ocr_text.length,
+        },
+        mode,
+        forwarded,
+      })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
   // Ten canonical pipeline tests. Each builds synthetic candidates +
   // signals and reports whether the pipeline behaved as specified.
   app.get('/api/admin/overlay-test', async (_req, res) => {
@@ -3197,6 +3303,104 @@ FORMATTING:
         expected: 'fires via Test D if conditions met; otherwise explains',
         actual: t10.fired ? 'FIRED' : t10.suppressed.map(s => `stage${s.stage}:${s.reason}`).join(';'),
         pass: true, // informational — always passes but shows outcome
+      })
+
+      // Test 11: Proactive mode with no recent screen observations.
+      // Simulates the exact failure I shipped: evaluator trusted a
+      // caller-supplied app='chrome' while zero screen_capture observations
+      // existed in the last 30s. The new Stage-0 gate must kill speculative
+      // candidates and cap everything else at 70.
+      // We work against whatever real DB state exists: if no screen
+      // observations in 30s, a predictive candidate MUST be suppressed.
+      const t11Candidate = makeCandidate({
+        matcher_name: 'predictive',
+        type: 'predictive',
+        label: 'DRAFT READY',
+        raw_title: 'Probably replying to Re: Some Email',
+        raw_body: 'Draft ready to send — speculative guess from predicted_actions.',
+        entity_id: 'thread-test-no-context',
+        base_confidence: 60,
+      })
+      const realCtx11 = await pool.query(
+        `SELECT 1 FROM observations
+         WHERE source IN ('screen_capture','app_activity')
+           AND timestamp > NOW() - INTERVAL '30 seconds' LIMIT 1`,
+      )
+      const hasRealCtx = realCtx11.rows.length > 0
+      const t11 = await runPipeline(pool, [t11Candidate], { ...baseSignals, app: 'chrome', mode: 'proactive' })
+      results.push({
+        test: '11. Proactive with no recent screen obs',
+        expected: hasRealCtx
+          ? 'live obs exist — pass through Stage 0 (informational)'
+          : 'predictive speculative candidate suppressed at Stage 0',
+        actual: t11.fired
+          ? `FIRED score=${t11.fired._score} (unexpected if no live ctx)`
+          : t11.suppressed.map(s => `stage${s.stage}:${s.reason}`).join(';'),
+        pass: hasRealCtx ? true : (!t11.fired && t11.suppressed.some(s => s.stage === 0 && /no_current_context/.test(s.reason))),
+      })
+
+      // Test 12: Abandoned predicted_action — entity surfaced ≥3 times
+      // with no user action should be suppressed with abandonment penalty.
+      try {
+        const abandonedEntity = 'thread-abandoned-test'
+        // Seed 3 prior overlay_log fires, all within 14 days.
+        const seeded = []
+        for (let k = 0; k < 3; k++) {
+          const idx = crypto.randomUUID()
+          seeded.push(idx)
+          await pool.query(
+            `INSERT INTO overlay_log (id, outcome, reason, entity_id, insight_type, matcher_name, stage, confidence, content_snapshot, timestamp)
+             VALUES ($1, 'fired', 'test_abandoned', $2, 'predictive', 'predictive', 10, 65, 'test', NOW() - (INTERVAL '1 day' * $3))`,
+            [idx, abandonedEntity, k + 1],
+          )
+        }
+        const t12Candidate = makeCandidate({
+          matcher_name: 'predictive',
+          type: 'predictive',
+          label: 'DRAFT READY',
+          raw_title: 'Probably replying to that abandoned thread',
+          raw_body: 'Draft ready — but the user has ignored this three times already.',
+          entity_id: abandonedEntity,
+          base_confidence: 60,
+        })
+        const t12 = await runPipeline(pool, [t12Candidate], { ...baseSignals, app: 'mail' })
+        results.push({
+          test: '12. Abandoned predicted_action (3+ prior fires, 0 clicks)',
+          expected: 'suppressed at Stage 10 with abandonment reason',
+          actual: t12.fired ? 'FIRED (wrong)' : t12.suppressed.map(s => `stage${s.stage}:${s.reason}`).join(';'),
+          pass: !t12.fired && t12.suppressed.some(s => s.stage === 10 && /abandoned_entity/.test(s.reason)),
+        })
+        // Cleanup.
+        await pool.query(`DELETE FROM overlay_log WHERE entity_id = $1 AND reason = 'test_abandoned'`, [abandonedEntity])
+      } catch (err: any) {
+        results.push({ test: '12. Abandoned action', expected: 'stage 10 suppress', actual: `error: ${err.message}`, pass: false })
+      }
+
+      // Test 13: Predictive cannot score above 75 without direct entity match.
+      // Fire a predictive candidate with high base, no direct entity match
+      // on screen (signals.app=chrome, unrelated title). The matcher-family
+      // cap must clamp the final score at 75 so we never see "confidence 99"
+      // again from a speculative guess.
+      const t13Candidate = makeCandidate({
+        matcher_name: 'predictive',
+        type: 'predictive',
+        label: 'DRAFT READY',
+        raw_title: 'Probably replying to some plausible email',
+        raw_body: 'Draft ready to send. All bonuses should stack except direct match.',
+        entity_id: 'thread-predictive-cap-test',
+        base_confidence: 60,
+        button: 'Draft',
+        action_type: 'use_draft',
+      })
+      const t13 = await runPipeline(pool, [t13Candidate], { ...baseSignals, app: 'mail', title: 'inbox' })
+      const t13score = t13.fired?._score ?? 0
+      results.push({
+        test: '13. Predictive hard-cap at 75',
+        expected: 'fires (if stage 5 passes) with score ≤ 75 — never 99',
+        actual: t13.fired
+          ? `FIRED score=${t13score} breakdown=${JSON.stringify(t13.fired._score_breakdown)}`
+          : t13.suppressed.map(s => `stage${s.stage}:${s.reason}`).join(';'),
+        pass: !t13.fired || t13score <= 75,
       })
 
       const passed = results.filter(r => r.pass).length

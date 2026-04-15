@@ -132,6 +132,31 @@ const PER_MATCHER_COOLDOWN_MS = 20 * 60 * 1000      // 20 minutes
 // Final score threshold — below this, nothing fires.
 const MIN_SCORE = 65
 
+// Per-matcher-family hard score caps. Predictive is by definition a guess:
+// it cannot hit a 99 just because the render stage succeeded. These caps
+// apply AFTER all scoring bonuses; to exceed them, a candidate must also
+// have a direct entity match on the current screen (enforced separately).
+const MATCHER_SCORE_CAPS: Record<string, number> = {
+  predictive: 75,
+  intent: 75,
+  proactive_commitment: 85,
+  proactive_calendar: 92,  // approaching meetings are the one thing worth loud
+  contact: 88,
+  relationship: 78,
+  email_commitment: 90,
+  calendar: 92,
+  file: 85,
+  centrum: 80,
+}
+
+// A predicted_action that has been surfaced N times without any action is
+// treated as abandoned — user is voting-with-silence.
+const ABANDONMENT_SURFACE_COUNT = 3
+// Thread staleness threshold for inferring "probably not interested".
+const STALE_THREAD_NO_REPLY_DAYS = 14
+// Lookback window for checking user reply history to a given sender.
+const REPLY_HISTORY_DAYS = 90
+
 // ── Main entry point ─────────────────────────────────────────────
 
 export async function runPipeline(
@@ -150,6 +175,52 @@ export async function runPipeline(
       type: c.type,
       title: c.raw_title,
     })
+  }
+
+  // ── Stage 0: Proactive context verification ──────────────────
+  // When mode='proactive', the server is usually driven by a scheduler,
+  // not by a fresh screen observation. A bad caller (or a test script)
+  // can pass fake signals.app and the downstream relevance gate will
+  // trust them. Cross-check against the real screen_capture /
+  // app_activity stream: if nothing has been observed in the last 30s,
+  // we don't know what the user is actually doing.
+  //
+  // With no current context:
+  //   - Drop every predictive / intent / sequence / centrum candidate
+  //   - Keep only genuinely critical time-based triggers (meeting in
+  //     ≤10min, deadline in ≤2h)
+  //   - Cap their final score at 70 (prevent "confidence 99" on cards
+  //     the user isn't looking at)
+  if (signals.mode === 'proactive') {
+    const realCtx = await getRealCurrentContext(pool)
+    if (!realCtx.available) {
+      const kept: Candidate[] = []
+      for (const c of candidates) {
+        const isCritical =
+          (c.label === 'UPCOMING' && c.critical) ||
+          (c.due_date && (new Date(c.due_date).getTime() - Date.now()) < 2 * 3600_000 && new Date(c.due_date).getTime() > Date.now())
+        const speculative = ['predictive', 'intent', 'sequence', 'centrum', 'relationship'].includes(c.matcher_name)
+        if (speculative || !isCritical) {
+          suppress(c, 0, 'no_current_context_available')
+          continue
+        }
+        // Mark so Stage 8 knows to cap.
+        (c as any)._no_live_context = true
+        kept.push(c)
+      }
+      candidates = kept
+      if (candidates.length === 0) return { fired: null, suppressed }
+    } else if (realCtx.app) {
+      // Real context observed — override signals.app/title with what we
+      // actually see. The caller's claimed signals.app may be stale.
+      const realAppLower = realCtx.app.toLowerCase()
+      if (signals.app && !realAppLower.includes(signals.app) && !signals.app.includes(realAppLower)) {
+        // Divergence: caller said one app, observation says another.
+        // Trust the observation.
+        signals.app = realAppLower
+        signals.title = (realCtx.title || '').toLowerCase()
+      }
+    }
   }
 
   // Stage 2
@@ -748,7 +819,7 @@ async function stageScoreAndLearn(
 ): Promise<Candidate | null> {
   // Fetch learning signals once (90-day window).
   const learning = await pool.query(
-    `SELECT trigger_action, user_action, trigger_context
+    `SELECT trigger_action, user_action, trigger_context, timestamp
      FROM correction_log
      WHERE timestamp > NOW() - INTERVAL '90 days'`,
   ).catch(() => ({ rows: [] as any[] }))
@@ -756,7 +827,24 @@ async function stageScoreAndLearn(
 
   const now = Date.now()
 
-  const scored: Candidate[] = candidates.map(c => {
+  // Per-entity historical surface count (overlay_log fires) — used to detect
+  // abandonment: a predicted_action surfaced ≥3 times with zero user action
+  // is voting-with-silence.
+  const entityIds = Array.from(new Set(candidates.map(c => c.entity_id)))
+  let surfaceCounts = new Map<string, number>()
+  if (entityIds.length > 0) {
+    const scRes = await pool.query(
+      `SELECT entity_id, COUNT(*)::int AS c FROM overlay_log
+       WHERE outcome = 'fired' AND entity_id = ANY($1::text[])
+         AND timestamp > NOW() - INTERVAL '14 days'
+       GROUP BY entity_id`,
+      [entityIds],
+    ).catch(() => ({ rows: [] as any[] }))
+    for (const r of scRes.rows) surfaceCounts.set(r.entity_id, r.c)
+  }
+
+  const scored: Candidate[] = []
+  for (const c of candidates) {
     const breakdown: Record<string, number> = {}
     breakdown.base = c.base_confidence
 
@@ -791,11 +879,45 @@ async function stageScoreAndLearn(
     const actCount = countLearning(learningRows, c, ['acted', 'action_taken', 'approved', 'approve'])
     if (actCount > 0) breakdown.action_bonus = Math.min(10, actCount * 3)
 
-    const score = Object.values(breakdown).reduce((a, b) => a + b, 0)
+    // User intent signal for email-addressed candidates: if the user has
+    // NOT replied to this sender in the last 90 days, a predicted "you'll
+    // probably reply" is almost certainly wrong.
+    if (c.matcher_name === 'predictive' || c.matcher_name === 'contact') {
+      const intent = await scoreUserIntent(pool, c)
+      if (intent.score !== 0) breakdown.intent = intent.score
+    }
+
+    // Abandonment: this specific entity has been surfaced N+ times with no
+    // click → treat as user-is-ignoring-this.
+    const sc = surfaceCounts.get(c.entity_id) || 0
+    if (sc >= ABANDONMENT_SURFACE_COUNT) {
+      breakdown.abandonment_penalty = -40  // effectively kills the score
+    }
+
+    let score = Object.values(breakdown).reduce((a, b) => a + b, 0)
+
+    // Matcher-family HARD cap. Speculative matchers (predictive, intent)
+    // cannot exceed their cap no matter how many bonuses accrue — unless
+    // we also have a direct entity match on the current screen. That's
+    // the only signal strong enough to override speculation.
+    const directMatch = ((c as any)._relevance_boost || 0) >= 20
+    const cap = MATCHER_SCORE_CAPS[c.matcher_name]
+    if (cap !== undefined && !directMatch && score > cap) {
+      breakdown.cap_applied = cap - score
+      score = cap
+    }
+
+    // No-live-context cap: when Stage 0 flagged the pipeline as running
+    // without real screen observations, nothing can exceed 70.
+    if ((c as any)._no_live_context && score > 70) {
+      breakdown.no_context_cap = 70 - score
+      score = 70
+    }
+
     c._score = score
     c._score_breakdown = breakdown
-    return c
-  })
+    scored.push(c)
+  }
 
   // Apply Stage-10 hard suppressions
   const passed: Candidate[] = []
@@ -811,6 +933,12 @@ async function stageScoreAndLearn(
     const entityDismisses14 = countEntityDismissals(learningRows, c, 14)
     if (entityDismisses14 >= 2) {
       suppress(c, 10, 'entity_dismissed_twice_last_14d'); continue
+    }
+
+    // Abandonment — if score was already blown by the penalty, suppress
+    // at Stage 10 with a clear reason rather than a generic score miss.
+    if ((c._score_breakdown?.abandonment_penalty ?? 0) < 0) {
+      suppress(c, 10, `abandoned_entity_surfaced_${surfaceCounts.get(c.entity_id) || 0}x`); continue
     }
 
     if ((c._score ?? 0) < localThreshold) {
@@ -865,6 +993,96 @@ function matcherActionRate(rows: any[], matcher: string): number {
   if (subset.length === 0) return 0
   const acted = subset.filter((r: any) => /act|approve/.test(String(r.user_action || ''))).length
   return acted / subset.length
+}
+
+// Pull the most recent screen_capture or app_activity observation to
+// figure out what the user is actually doing RIGHT NOW. Returns
+// { available: false } if nothing in the last 30 seconds — caller
+// should treat the mode='proactive' context as unknown.
+async function getRealCurrentContext(pool: Pool): Promise<{
+  available: boolean; app?: string; title?: string; ageMs?: number;
+}> {
+  try {
+    const r = await pool.query(
+      `SELECT timestamp, raw_content FROM observations
+       WHERE source IN ('screen_capture', 'app_activity')
+         AND timestamp > NOW() - INTERVAL '30 seconds'
+       ORDER BY timestamp DESC LIMIT 1`,
+    )
+    if (r.rows.length === 0) return { available: false }
+    const row = r.rows[0]
+    const ageMs = Date.now() - new Date(row.timestamp).getTime()
+    // screen-reader formats raw_content as "App: X\nWindow: Y\nURL: ..."
+    const rc: string = row.raw_content || ''
+    const appMatch = rc.match(/^App:\s*(.+)$/m)
+    const titleMatch = rc.match(/^Window:\s*(.+)$/m)
+    return {
+      available: true,
+      app: appMatch ? appMatch[1].trim() : undefined,
+      title: titleMatch ? titleMatch[1].trim() : undefined,
+      ageMs,
+    }
+  } catch {
+    return { available: false }
+  }
+}
+
+// Infer user intent toward a sender/entity by looking at their email
+// history. For predicted_actions about a sender, if the user has
+// NOT replied in the last 90 days AND the thread is old, the "probably
+// replying" prediction is almost certainly wrong.
+//
+// Returns a positive score bonus (user has acted on this entity before)
+// or a negative penalty (user has zero replies → this prediction is
+// speculative at best). A zero return means no signal.
+async function scoreUserIntent(pool: Pool, c: Candidate): Promise<{ score: number; reason: string }> {
+  // Only applies when the entity is a sender/email/thread.
+  const eid = c.entity_id || ''
+  const looksLikeEmail = eid.includes('@')
+  const looksLikeThread = eid.startsWith('thread-')
+  if (!looksLikeEmail && !looksLikeThread) return { score: 0, reason: '' }
+
+  try {
+    if (looksLikeEmail) {
+      // How many threads with this sender where the user replied?
+      const r = await pool.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE awaiting_reply = 0) ::int AS user_replied,
+           COUNT(*) FILTER (WHERE awaiting_reply = 1) ::int AS user_owes,
+           MAX(last_message_date)                              AS last_msg
+         FROM email_threads
+         WHERE participants LIKE $1
+           AND last_message_date > (NOW() - INTERVAL '90 days')::text`,
+        [`%${eid}%`],
+      )
+      const row = r.rows[0] || {}
+      const replied = Number(row.user_replied || 0)
+      const owes = Number(row.user_owes || 0)
+      if (replied === 0 && owes >= 2) {
+        return { score: -25, reason: 'zero_replies_in_90d_to_this_sender' }
+      }
+      if (replied >= 3) {
+        return { score: 5, reason: 'active_replier_to_this_sender' }
+      }
+    }
+
+    if (looksLikeThread) {
+      const tid = eid  // thread-XXXX is the thread_id format on our side
+      const r = await pool.query(
+        `SELECT awaiting_reply, stale_days, last_message_date
+         FROM email_threads WHERE thread_id = $1 LIMIT 1`,
+        [tid],
+      )
+      const row = r.rows[0]
+      if (row) {
+        const stale = Number(row.stale_days || 0)
+        if (row.awaiting_reply === 1 && stale >= STALE_THREAD_NO_REPLY_DAYS) {
+          return { score: -20, reason: `awaiting_user_reply_${stale}d_likely_ignored` }
+        }
+      }
+    }
+  } catch {}
+  return { score: 0, reason: '' }
 }
 
 // ── Stage 9: Content rendering ───────────────────────────────────
