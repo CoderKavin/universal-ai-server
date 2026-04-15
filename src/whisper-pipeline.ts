@@ -10,6 +10,7 @@
  */
 
 import type { Pool } from 'pg'
+import { checkTopicGrounding } from './topic-grounding'
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -298,6 +299,15 @@ export async function validateWhisperForFiring(
   // 0. Source filter — automated senders are noise.
   if (c.trigger_source?.email_from && isAutomatedSender(c.trigger_source.email_from)) {
     return { ok: false, reason: 'automated_sender' }
+  }
+
+  // 0b. Topic grounding — the whisper body must mention at least one
+  // token connected to the user's real world. Blocks contaminated chains
+  // (Hegseth-class) that passed earlier gates before the grounding check
+  // was added.
+  const grounding = await checkTopicGrounding(pool, `${c.body || ''} ${c.subtitle || ''}`)
+  if (!grounding.grounded) {
+    return { ok: false, reason: `ungrounded:${grounding.reason}` }
   }
 
   // 1. Content quality.

@@ -28,6 +28,8 @@
 
 import { getPool, getSettings, getLivingProfile } from './db'
 import crypto from 'crypto'
+import { checkTopicGrounding } from './topic-grounding'
+import { isAutomatedSender, extractFromHeader } from './whisper-pipeline'
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -57,6 +59,30 @@ export async function generateChain(
   const settings = await getSettings()
   const apiKey = settings.api_key || process.env.ANTHROPIC_API_KEY
   if (!apiKey) return null
+
+  // ── Source filter: refuse triggers sourced from automated senders.
+  // The Hegseth bug: an NYT Breaking News email passed through
+  // life-events.ts, became a "new_project" event, and then got here.
+  // If the trigger text still contains a recognizable automated "From:"
+  // header, refuse to reason about it.
+  const fromHdr = extractFromHeader(triggerEvent)
+  if (fromHdr && isAutomatedSender(fromHdr)) {
+    console.log(`[chain] refusing trigger from automated sender: ${fromHdr}`)
+    return null
+  }
+
+  // ── Topic grounding: the trigger must mention at least one token
+  // that connects to the user's real world (contacts, active
+  // commitments, upcoming calendar, persona projects). A news article
+  // about a US official is not grounded; a meeting with Rajeev is.
+  const grounding = await checkTopicGrounding(pool, triggerEvent)
+  if (!grounding.grounded) {
+    console.log(
+      `[chain] suppressed ungrounded trigger: "${triggerEvent.slice(0, 80)}" ` +
+      `(reason=${grounding.reason})`,
+    )
+    return null
+  }
 
   // Don't duplicate: check if a chain already exists for this trigger entity
   if (triggerEntity) {

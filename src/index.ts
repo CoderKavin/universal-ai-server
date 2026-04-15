@@ -42,6 +42,7 @@ import {
   significantTokens, matchCorrections as matchCorrectionsExternal,
   scoreFromCorrections as scoreFromCorrectionsExternal,
 } from './dismissal-learning'
+import { checkTopicGrounding, buildUserEntitySet, clearEntitySetCache } from './topic-grounding'
 import {
   initDB, migrate, getPool, getSettings, setSetting,
   getLivingProfile, setLivingProfile,
@@ -1630,6 +1631,149 @@ FORMATTING:
       })
     } catch (err: any) {
       res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Admin: test the topic grounding check. Useful to confirm a given
+  // body would or would not be accepted by the chain/whisper pipelines.
+  app.post('/api/admin/grounding-test', async (req, res) => {
+    try {
+      const pool = getPool()
+      const text = String(req.body?.text || '')
+      const r = await checkTopicGrounding(pool, text)
+      res.json(r)
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Admin: show the active user entity set (tokens we'd ground against).
+  app.get('/api/admin/entity-set', async (_req, res) => {
+    try {
+      const pool = getPool()
+      clearEntitySetCache()  // always fresh for inspection
+      const s = await buildUserEntitySet(pool)
+      res.json({
+        token_count: s.tokens.size,
+        sample_tokens: Array.from(s.tokens).slice(0, 80),
+        source_counts: s.source_counts,
+      })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // Admin: mark contaminated chains/actions/life_events and their
+  // downstream predicted_actions as status='contaminated'. Default is
+  // dry-run; ?execute=1 actually flips statuses.
+  // Criteria: trigger_event / summary / title / description references
+  // a news pattern AND the content is not grounded in the user entity set.
+  app.post('/api/admin/contamination-cleanup', async (req, res) => {
+    try {
+      const pool = getPool()
+      const execute = String(req.query.execute || '') === '1'
+
+      // Candidate chains: match news patterns.
+      const newsPatterns = [
+        '%Hegseth%', '%Pentagon%', '%NATO%', '%Ukraine%', '%Israel%',
+        '%Gaza%', '%Putin%', '%Biden%', '%Trump%', '%Harris%',
+        '%Supreme Court%', '%SCOTUS%', '%impeachment%', '%tariff%',
+        '%NASDAQ%', '%bitcoin%', '%Fed rate%', '%military leadership%',
+        '%military strike%', '%breakingnews%', '%critical analysis of%',
+      ]
+
+      const chainCandidates = await pool.query(
+        `SELECT ac.id, ac.trigger_event FROM action_chains ac
+         WHERE ac.trigger_event ILIKE ANY($1::text[])
+            OR EXISTS (SELECT 1 FROM chain_steps cs
+                       WHERE cs.chain_id = ac.id
+                         AND (cs.title ILIKE ANY($1::text[])
+                              OR cs.description ILIKE ANY($1::text[])))`,
+        [newsPatterns],
+      )
+      const paCandidates = await pool.query(
+        `SELECT id, title, description, trigger_context FROM predicted_actions
+         WHERE title ILIKE ANY($1::text[])
+            OR description ILIKE ANY($1::text[])
+            OR trigger_context ILIKE ANY($1::text[])`,
+        [newsPatterns],
+      )
+      const leCandidates = await pool.query(
+        `SELECT id, summary FROM life_events WHERE summary ILIKE ANY($1::text[])`,
+        [newsPatterns],
+      )
+
+      // For each, run the grounding check. Only mark as contaminated
+      // if the content is truly ungrounded (a Hegseth chain that also
+      // references "Kavin" would ground on "kavin" — don't nuke that).
+      const ungroundedChainIds: string[] = []
+      for (const row of chainCandidates.rows) {
+        const g = await checkTopicGrounding(pool, row.trigger_event)
+        if (!g.grounded) ungroundedChainIds.push(row.id)
+      }
+      const ungroundedPaIds: string[] = []
+      for (const row of paCandidates.rows) {
+        const g = await checkTopicGrounding(pool, `${row.title || ''} ${row.description || ''} ${row.trigger_context || ''}`)
+        if (!g.grounded) ungroundedPaIds.push(row.id)
+      }
+      const ungroundedLeIds: string[] = []
+      for (const row of leCandidates.rows) {
+        const g = await checkTopicGrounding(pool, row.summary)
+        if (!g.grounded) ungroundedLeIds.push(row.id)
+      }
+
+      if (!execute) {
+        return res.json({
+          dry_run: true,
+          would_mark_chains_contaminated: ungroundedChainIds.length,
+          would_mark_predicted_actions_contaminated: ungroundedPaIds.length,
+          would_mark_life_events_contaminated: ungroundedLeIds.length,
+          how_to_execute: 'POST /api/admin/contamination-cleanup?execute=1',
+        })
+      }
+
+      let chainsMarked = 0
+      let paMarked = 0
+      let leMarked = 0
+
+      if (ungroundedChainIds.length > 0) {
+        const r = await pool.query(
+          `UPDATE action_chains SET status = 'contaminated' WHERE id = ANY($1::text[])`,
+          [ungroundedChainIds],
+        )
+        chainsMarked = r.rowCount || 0
+        // Invalidate the linked predicted_actions (steps 2/3 auto-seeded).
+        await pool.query(
+          `UPDATE predicted_actions
+           SET status = 'invalidated'
+           WHERE related_entity LIKE 'chain-' || ANY($1::text[]) || '%'`,
+          [ungroundedChainIds],
+        ).catch(() => {})
+      }
+      if (ungroundedPaIds.length > 0) {
+        const r = await pool.query(
+          `UPDATE predicted_actions SET status = 'contaminated' WHERE id = ANY($1::text[])`,
+          [ungroundedPaIds],
+        )
+        paMarked = r.rowCount || 0
+      }
+      if (ungroundedLeIds.length > 0) {
+        const r = await pool.query(
+          `UPDATE life_events SET type = 'contaminated' WHERE id = ANY($1::text[])`,
+          [ungroundedLeIds],
+        )
+        leMarked = r.rowCount || 0
+      }
+
+      res.json({
+        dry_run: false,
+        chains_marked_contaminated: chainsMarked,
+        predicted_actions_marked_contaminated: paMarked,
+        life_events_marked_contaminated: leMarked,
+      })
+    } catch (err: any) {
+      console.error('[contamination-cleanup] failed:', err.message)
+      res.status(500).json({ error: err.message, stack: err.stack?.slice(0, 400) })
     }
   })
 
